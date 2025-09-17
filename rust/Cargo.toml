@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "nix-c-raw",
+    "nix-expr",
+    "nix-fetchers",
+    "nix-flake",
+    "nix-store",
+    "nix-util",
+    "flack-serve"
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = [
+  "Morgan Jones <me@numin.it>"
+]
+edition = "2024"
+license = "LGPL"
+homepage = "https://github.com/numinit/flack"
+repository = "https://github.com/numinit/flack"
