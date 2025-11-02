@@ -1,5 +1,4 @@
 {
-
   description = "Serve your flakes";
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -29,6 +28,7 @@
           2
         ];
       };
+      inherit (nixpkgs-lib) lib;
     in
     flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [
@@ -37,48 +37,50 @@
         inputs.flake-parts.flakeModules.easyOverlay
       ];
 
-      flake = rec {
+      flake = {
         versionTemplate = "0.1-<lastModifiedDate>-<rev>";
         inherit (flakeverConfig) version versionCode;
 
-        lib = import ./lib.nix {
-          inherit (nixpkgs-lib) lib;
-        };
-
-        flack.app = lib.mkApp {
-          mount = {
-            "/pkgs" = {
-              route.GET."/:...path" =
-                req:
-                let
-                  pkgs = self.legacyPackages.${req.system};
-                  inherit (pkgs) lib;
-                  pkg = lib.attrByPath req.params.path null pkgs;
-                  subPath =
+        flack =
+          let
+            flack = import ./flack.nix lib;
+          in
+          flack
+          // {
+            apps.default = flack.mkApp {
+              mount = {
+                "/pkgs" = {
+                  route.GET."/:...path" =
+                    req:
                     let
-                      names = lib.attrNames req.query;
+                      pkgs = self.legacyPackages.${req.system};
+                      pkg = lib.attrByPath req.params.path null pkgs;
+                      subPath =
+                        let
+                          names = lib.attrNames req.query;
+                        in
+                        if lib.length names == 1 then lib.strings.normalizePath ("/" + lib.head names) else "";
                     in
-                    if lib.length names == 1 then lib.strings.normalizePath ("/" + lib.head names) else "";
-                in
-                if pkg == null then req.res 400 else req.res 200 { } "${pkg}${subPath}";
+                    if pkg == null then req.res 400 else req.res 200 { } "${pkg}${subPath}";
+                };
+              };
+              use = {
+                "/foo" =
+                  req: if req.get "X-Auth-Token" != "supersecret" then req.res 401 { } "Unauthorized" else req;
+              };
+              route = {
+                GET."/" = req: req.res 200 { "hello" = "world"; };
+                GET."/foo/:bar" =
+                  req:
+                  req.res 200 { } {
+                    inherit (req) pathComponents;
+                    inherit (req.params) bar;
+                  };
+                POST."/foo/:bar" = req: req.res 201 { inherit (req.params) bar; };
+                GET."/baz" = req: req.res 200 { "baz" = "quux"; };
+              };
             };
           };
-          use = {
-            "/foo" =
-              req: if req.get "X-Auth-Token" != "supersecret" then req.res 401 { } "Unauthorized" else req;
-          };
-          route = {
-            GET."/" = req: req.res 200 { "hello" = "world"; };
-            GET."/foo/:bar" =
-              req:
-              req.res 200 { } {
-                inherit (req) pathComponents;
-                inherit (req.params) bar;
-              };
-            POST."/foo/:bar" = req: req.res 201 { inherit (req.params) bar; };
-            GET."/baz" = req: req.res 200 { "baz" = "quux"; };
-          };
-        };
       };
 
       systems = [

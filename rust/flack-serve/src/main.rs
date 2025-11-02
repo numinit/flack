@@ -12,9 +12,13 @@ use actix_files::NamedFile;
 use actix_web::http::header::{HeaderName, HeaderValue, TryIntoHeaderPair};
 use actix_web::http::{header, StatusCode};
 use actix_web::{Either, HttpRequest, HttpResponseBuilder};
-use anyhow::{bail, Result};
+use actix_web::{
+    web, App, HttpResponse, HttpServer
+};
 
 use uuid::Uuid;
+
+use clap::Parser;
 
 use nix_bindings_expr::{
     eval_state::EvalState,
@@ -22,77 +26,52 @@ use nix_bindings_expr::{
 };
 use nix_bindings_flake::EvalStateBuilderExt as _;
 
-use actix_web::{
-    web, App, HttpResponse, HttpServer
-};
 use nix_bindings_store::path::StorePath;
 use nix_bindings_store::store::Store;
 
-fn get_flake(
-    eval_state: &mut EvalState,
-    fetch_settings: nix_bindings_fetchers::FetchersSettings,
-    flake_settings: nix_bindings_flake::FlakeSettings,
-    flakeref_str: &str,
-    input_overrides: &Vec<(String, String)>,
-) -> Result<Value> {
-    let mut parse_flags = nix_bindings_flake::FlakeReferenceParseFlags::new(&flake_settings)?;
+#[derive(Parser, Clone, Debug)]
+#[command(version, about, long_about = None)]
+struct FlackArgs {
+    /// The directory to use; defaults to the current working directory
+    #[arg(short = 'd', long, default_value = ".")]
+    dir: String,
 
-    let cwd = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("failed to get current directory: {}", e))?;
-    let cwd = cwd
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("failed to convert current directory to string"))?;
-    parse_flags.set_base_directory(cwd)?; // TODO: nope, not this.
+    /// The flake reference to use; defaults to "."
+    #[arg(short = 'f', long, default_value = ".")]
+    flake: String,
 
-    let parse_flags = parse_flags;
+    /// The flake attribute containing the Flack app
+    #[arg(short = 'a', long, default_value = "flack.apps.default")]
+    attr: String,
 
-    let mut lock_flags = nix_bindings_flake::FlakeLockFlags::new(&flake_settings)?;
-    lock_flags.set_mode_write_as_needed()?; // TODO: nope, not this.
-    for (override_path, override_ref_str) in input_overrides {
-        let (override_ref, fragment) = nix_bindings_flake::FlakeReference::parse_with_fragment(
-            &fetch_settings,
-            &flake_settings,
-            &parse_flags,
-            override_ref_str,
-        )?;
-        if !fragment.is_empty() {
-            bail!(
-                "input override {} has unexpected fragment: {}",
-                override_path,
-                fragment
-            );
-        }
-        lock_flags.add_input_override(override_path, &override_ref)?;
-    }
-    let lock_flags = lock_flags;
+    /// The store URI
+    #[arg(short = 's', long, default_value = "unix://")]
+    store: String,
 
-    let (flakeref, fragment) = nix_bindings_flake::FlakeReference::parse_with_fragment(
-        &fetch_settings,
-        &flake_settings,
-        &parse_flags,
-        flakeref_str,
-    )?;
-    if !fragment.is_empty() {
-        bail!(
-            "flake reference {} has unexpected fragment: {}",
-            flakeref_str,
-            fragment
-        );
-    }
-    let flake = nix_bindings_flake::LockedFlake::lock(
-        &fetch_settings,
-        &flake_settings,
-        eval_state,
-        &lock_flags,
-        &flakeref,
-    )?;
+    /// The maximum number of connections to the store; set to 0 to use all CPUs
+    #[arg(short = 'c', long, default_value_t = 0)]
+    max_connections: u16,
 
-    flake.outputs(&flake_settings, eval_state)
+    /// The host to spawn the server on
+    #[arg(short = 'H', long, default_value = "localhost")]
+    host: String,
+
+    /// The port to spawn the server on
+    #[arg(short = 'p', long, default_value_t = 2019)]
+    port: u16,
+
+    /// The log level
+    #[arg(short = 'l', long, default_value = "info")]
+    log_level: String,
+
+    /// The log style
+    #[arg(short = 'L', long, default_value = "always")]
+    log_style: String
 }
 
 pub struct FlackApp {
-    address: &'static str,
-    port: u16,
+    args: FlackArgs,
+    attr: Vec<String>,
     system: String,
     flake: Value,
     eval_state: Arc<Mutex<EvalState>>
@@ -104,6 +83,85 @@ struct FlackResponse {
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Option<String>,
     body_path: Option<PathBuf>
+}
+
+fn get_flake(
+    eval_state: &mut EvalState,
+    fetch_settings: nix_bindings_fetchers::FetchersSettings,
+    flake_settings: nix_bindings_flake::FlakeSettings,
+    basedir_str: &String,
+    flakeref_str: &String,
+    input_overrides: &Vec<(String, String)>,
+) -> std::io::Result<Value> {
+    let mut parse_flags = nix_bindings_flake::FlakeReferenceParseFlags::new(&flake_settings)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    parse_flags.set_base_directory(basedir_str.as_str())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let parse_flags = parse_flags;
+
+    let mut lock_flags = nix_bindings_flake::FlakeLockFlags::new(&flake_settings)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    lock_flags.set_mode_virtual()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    for (override_path, override_ref_str) in input_overrides {
+        let (override_ref, fragment) = nix_bindings_flake::FlakeReference::parse_with_fragment(
+            &fetch_settings,
+            &flake_settings,
+            &parse_flags,
+            override_ref_str)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        if !fragment.is_empty() {
+            return std::io::Result::Err(
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!(
+                        "input override {} has unexpected fragment: {}",
+                        override_path,
+                        fragment
+                    ).as_str()
+                )
+            );
+        }
+        lock_flags.add_input_override(override_path, &override_ref)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    }
+    let lock_flags = lock_flags;
+
+    let (flakeref, fragment) = nix_bindings_flake::FlakeReference::parse_with_fragment(
+        &fetch_settings,
+        &flake_settings,
+        &parse_flags,
+        flakeref_str.as_str())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if !fragment.is_empty() {
+        return std::io::Result::Err(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "flake reference {} has unexpected fragment: {}",
+                    flakeref_str,
+                    fragment
+                ).as_str()
+            )
+        )
+    }
+
+    let flake = nix_bindings_flake::LockedFlake::lock(
+        &fetch_settings,
+        &flake_settings,
+        eval_state,
+        &lock_flags,
+        &flakeref)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    let outputs = flake.outputs(&flake_settings, eval_state)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    std::io::Result::Ok(outputs)
 }
 
 impl FlackResponse {
@@ -247,10 +305,11 @@ fn serve_path_or_text(
     response: &mut FlackResponse,
     st: &mut EvalState,
     store: &mut Store,
+    dir: &String,
     value: &Value
 ) -> Result<FlackResponse, FlackResponse> {
     debug!("Forcing value");
-    let to_string = st.eval_from_string("builtins.toString", ".")
+    let to_string = st.eval_from_string("builtins.toString", dir.as_str())
         .map_err(|err| response.server_error(err))?;
     let to_string_value = st.call(to_string, value.clone())
         .map_err(|err| response.server_error(err))?;
@@ -278,7 +337,9 @@ fn serve_path_or_text(
 
 async fn flack_handler(req: HttpRequest, body: &web::Bytes) -> Result<FlackResponse, FlackResponse> {
     let app = req.app_data::<web::Data<FlackApp>>().unwrap();
-    let port = app.port;
+    let dir = app.args.dir.clone();
+    let port = app.args.port;
+    let attr = app.attr.clone();
     let system = app.system.as_str();
 
     let mut response = FlackResponse::new();
@@ -364,24 +425,18 @@ async fn flack_handler(req: HttpRequest, body: &web::Bytes) -> Result<FlackRespo
 
         let mut store = st.store().clone();
 
-        let flake = flake_mutex.get_cloned()
+        let mut app = flake_mutex.get_cloned()
             .map_err(|err| response.server_error(err))?;
 
-        let flack = match st
-            .require_attrs_select_opt(&flake, "flack")
-            .map_err(|err| response.not_found(err))?
-        {
-            Some(v) => v,
-            None => return Err(response.not_found("attribute 'flack' not found")),
-        };
-
-        let app = match st
-            .require_attrs_select_opt(&flack, "app")
-            .map_err(|err| response.not_found(err))?
-        {
-            Some(v) => v,
-            None => return Err(response.not_found("attribute 'flack.app' not found")),
-        };
+        for item in &attr {
+            app = match st
+                .require_attrs_select_opt(&app, item)
+                .map_err(|err| response.not_found(err))?
+            {
+                Some(v) => v,
+                None => return Err(response.not_found(format!("attribute '{}' not found", item))),
+            };
+        }
 
         let env = env_mutex.get_cloned()
             .map_err(|err| response.server_error(err))?;
@@ -392,7 +447,7 @@ async fn flack_handler(req: HttpRequest, body: &web::Bytes) -> Result<FlackRespo
         let length = st.require_list_size(&res)
             .map_err(|err| response.server_error(err))?;
         if length != 3 {
-            return Err(response.server_error("result of flack.app did not have length 3"));
+            return Err(response.server_error("result of flack app did not have length 3"));
         }
         let code_val = match st.require_list_select_idx_strict(&res, 0)
             .map_err(|err| response.server_error(err))?
@@ -444,7 +499,7 @@ async fn flack_handler(req: HttpRequest, body: &web::Bytes) -> Result<FlackRespo
         }
 
         if body_type == ValueType::String {
-            serve_path_or_text(&mut response, &mut st, &mut store, &body)
+            serve_path_or_text(&mut response, &mut st, &mut store, &dir, &body)
         } else if body_type == ValueType::AttrSet {
             // Could be a derivation.
             let attrs_type = match st.require_attrs_select_opt(&body, "type") {
@@ -458,10 +513,10 @@ async fn flack_handler(req: HttpRequest, body: &web::Bytes) -> Result<FlackRespo
                 Err(_) => "attrs".to_string(),
             };
             if attrs_type.as_str().eq("derivation") {
-                serve_path_or_text(&mut response, &mut st, &mut store, &body)
+                serve_path_or_text(&mut response, &mut st, &mut store, &dir, &body)
             } else {
                 // Normal attrset, try to coerce to JSON
-                let to_json = st.eval_from_string("builtins.toJSON", ".")
+                let to_json = st.eval_from_string("builtins.toJSON", dir.as_str())
                     .map_err(|err| response.server_error(err))?;
                 let json_str_value = st.call(to_json, body)
                     .map_err(|err| response.server_error(err))?;
@@ -529,28 +584,44 @@ async fn flack(req: HttpRequest, body: web::Bytes) -> actix_web::Result<HttpResp
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let env = env_logger::Env::default()
-        .filter_or("FLACK_LOG_LEVEL", "info")
-        .write_style_or("FLACK_LOG_STYLE", "always");
+    let mut args = FlackArgs::parse();
 
-    env_logger::init_from_env(env);
+    let env = env_logger::Env::default()
+        .filter_or("FLACK_LOG_LEVEL", args.log_level.as_str())
+        .write_style_or("FLACK_LOG_STYLE", args.log_style.as_str());
+    let logger = env_logger::init_from_env(env);
+
+    args.dir = std::fs::canonicalize(args.dir)?.to_str().unwrap_or(".").to_string();
+
+    info!("Serving project directory: {}", args.dir);
+
+    if args.max_connections < 1 {
+        // Default the max connections to the available parallelism.
+        let max_connections = match std::thread::available_parallelism() {
+            Ok(val) => val,
+            Err(err) => {
+                warn!("Error getting parallelism, defaulting to 1: {:?}", err);
+                NonZero::new(1).unwrap()
+            }
+        };
+        args.max_connections = max_connections.get() as u16;
+    }
+
+    let store_uri = url::Url::parse_with_params(
+        args.store.as_str(),
+        &[("max-connections", format!("{}", args.max_connections).as_str())])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
     let _gc_guard = nix_bindings_expr::eval_state::gc_register_my_thread()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-    let max_connections = match std::thread::available_parallelism() {
-        Ok(val) => val,
-        Err(err) => {
-            debug!("Error getting max connections: {:?}", err);
-            NonZero::new(1).unwrap()
-        }
-    };
+    info!("Connecting to store: {}", store_uri.to_string());
 
-    let uri = format!("unix://?max-connections={}", max_connections);
-    info!("Initializing with store URI: {}", uri);
+    let store = nix_bindings_store::store::Store::open(Some(store_uri.to_string().as_str()), [])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))?;
 
-    let store = nix_bindings_store::store::Store::open(Some(uri.as_str()), [])
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    info!("Loading flake: {}", args.flake);
+
     let flake_settings = nix_bindings_flake::FlakeSettings::new()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let fetch_settings = nix_bindings_fetchers::FetchersSettings::new()
@@ -561,31 +632,51 @@ async fn main() -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
         .build()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let flake = get_flake(&mut eval_state, fetch_settings, flake_settings, ".", &std::vec::Vec::new())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-    info!("Loaded flake: {:?}", eval_state.require_attrs_names(&flake));
+    let flake = get_flake(&mut eval_state, fetch_settings, flake_settings, &args.dir, &args.flake, &std::vec::Vec::new())?;
 
+    info!(
+        "Flake loaded successfully: {:?}",
+        eval_state.require_attrs_names(&flake)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+    );
+
+    let host = args.host.clone();
+    let log_host = args.host.clone();
+    let port = args.port.clone();
+
+    let args_mutex = Arc::new(Mutex::<FlackArgs>::new(args));
     let flake_mutex = Arc::new(Mutex::<Value>::new(flake));
     let eval_mutex = Arc::new(Mutex::<EvalState>::new(eval_state));
 
-    let address = "127.0.0.1";
-    let port = 1111;
-
-    HttpServer::new(move || {
-        let flake_data = flake_mutex.get_cloned();
+    let server = HttpServer::new(move || {
+        let args_data = args_mutex.get_cloned().expect("no args");
+        let flake_data = flake_mutex.get_cloned().expect("no flake");
         let eval_data = eval_mutex.get_cloned();
+        let attr = args_data.attr.split('.').map(str::to_string).collect();
         let app = FlackApp {
-            address, port,
+            args: args_data,
+            attr,
             system: nix_bindings_util::settings::get("system").unwrap_or("unknown".to_string()),
-            flake: flake_data.expect("no flake"),
+            flake: flake_data,
             eval_state: Arc::new(Mutex::<EvalState>::new(eval_data.expect("no eval state")))
         };
+
         App::new()
+            .wrap(actix_web::middleware::Logger::default())
             .app_data(web::Data::new(app))
             .default_service(web::route().to(flack))
     })
-    .bind((address, port))?
-    .run()
-    .await
+    .bind((host, port))?;
+
+    info!(r#"
+    ________    ___   ________ __
+   / ____/ /   /   | / ____/ //_/
+  / /_  / /   / /| |/ /   / ,<
+ / __/ / /___/ ___ / /___/ /| |
+/_/   /_____/_/  |_\____/_/ |_|
+Bound to {}:{}
+"#, log_host, port);
+
+    server.run().await
 }
