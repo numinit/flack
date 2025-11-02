@@ -85,14 +85,14 @@ let
     prefix: path: handler:
     let
       pathComponents = splitPath prefix path;
-      matchComponent = match "^:(\\.\\.\\.)?([^./]+)$";
+      inherit (flackLib.paths) matchRoutePlaceholder;
     in
     foldl (
       s: x:
       let
         isSplat = length s > 0 && (elemAt s (length s - 1)).splat;
         isLast = length x == length pathComponents;
-        componentMatch = matchComponent (elemAt x (length x - 1));
+        componentMatch = matchRoutePlaceholder (elemAt x (length x - 1));
         thePath =
           if isSplat || componentMatch == null && !isLast then
             # We already have the last path component, or this is a normal path component.
@@ -249,12 +249,15 @@ let
 
   flack = {
     mkApp =
-      appOrModules:
+      {
+        modules,
+        specialArgs ? { },
+      }:
       let
-        providedModules = if isList appOrModules then appOrModules else singleton appOrModules;
+        providedModules = if isList modules then modules else singleton modules;
         evalResult = evalModules {
           modules = [ ./module.nix ] ++ providedModules;
-          specialArgs = {
+          specialArgs = specialArgs // {
             inherit flack;
           };
         };

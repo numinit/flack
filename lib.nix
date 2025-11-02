@@ -5,6 +5,7 @@ let
     toUpper
     replaceStrings
     splitString
+    concatMapStringsSep
     hasPrefix
     hasSuffix
     normalizePath
@@ -55,8 +56,46 @@ rec {
         "HTTP_${normalized}";
   };
 
+  verbs =
+    let
+      verbList = [
+        "checkout"
+        "copy"
+        "delete"
+        "get"
+        "head"
+        "lock"
+        "m-search"
+        "merge"
+        "mkactivity"
+        "mkcol"
+        "move"
+        "notify"
+        "options"
+        "patch"
+        "post"
+        "purge"
+        "put"
+        "report"
+        "search"
+        "subscribe"
+        "trace"
+        "unlock"
+        "unsubscribe"
+      ];
+      verbRegex = "^(${concatMapStringsSep "|" toUpper verbList})$";
+    in
+    rec {
+      # Matches a HTTP verb.
+      matchVerb = match verbRegex;
+
+      # Returns true if the given verb is valid.
+      isVerb = verb: matchVerb verb != null;
+    };
+
   paths = rec {
-    # Returns a normalized path - that is, one with a leading and trailing / that can be toposorted.
+    # Returns a normalized path - that is, one with a leading and trailing /.
+    # Deletes consecutive slashes.
     mkNormalizedPath =
       prefix: path:
       let
@@ -78,10 +117,16 @@ rec {
     splitPath =
       prefix: path:
       singleton "/" ++ tail (splitString "/" (removeSuffix "/" (mkNormalizedPath prefix path)));
+
+    # Matches a path component.
+    matchPathComponent = match "^[^/]+$";
+
+    # Matches a path component containing a route placeholder.
+    matchRoutePlaceholder = match "^:(\\.\\.\\.)?([^./]+)$";
   };
 
-  # Parses a query string into an attrset.
   queries = {
+    # Parses a query string into an attrset.
     parseQuery =
       query:
       foldl (
@@ -117,8 +162,8 @@ rec {
       ) { } (splitString "&" query);
   };
 
-  # Creates a request.
   flack = {
+    # Creates a Flack request object from the Flack environment.
     mkReq =
       app: env:
       let

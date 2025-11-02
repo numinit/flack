@@ -589,7 +589,7 @@ async fn main() -> std::io::Result<()> {
     let env = env_logger::Env::default()
         .filter_or("FLACK_LOG_LEVEL", args.log_level.as_str())
         .write_style_or("FLACK_LOG_STYLE", args.log_style.as_str());
-    let logger = env_logger::init_from_env(env);
+    env_logger::init_from_env(env);
 
     args.dir = std::fs::canonicalize(args.dir)?.to_str().unwrap_or(".").to_string();
 
