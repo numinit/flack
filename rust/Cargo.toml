@@ -1,11 +1,5 @@
 [workspace]
 members = [
-    "nix-c-raw",
-    "nix-expr",
-    "nix-fetchers",
-    "nix-flake",
-    "nix-store",
-    "nix-util",
     "flack-serve"
 ]
 resolver = "2"

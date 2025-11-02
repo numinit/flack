@@ -16,26 +16,26 @@ use anyhow::{bail, Result};
 
 use uuid::Uuid;
 
-use nix_expr::{
+use nix_bindings_expr::{
     eval_state::EvalState,
     value::{Value, ValueType},
 };
-use nix_flake::EvalStateBuilderExt as _;
+use nix_bindings_flake::EvalStateBuilderExt as _;
 
 use actix_web::{
     web, App, HttpResponse, HttpServer
 };
-use nix_store::path::StorePath;
-use nix_store::store::Store;
+use nix_bindings_store::path::StorePath;
+use nix_bindings_store::store::Store;
 
 fn get_flake(
     eval_state: &mut EvalState,
-    fetch_settings: nix_fetchers::FetchersSettings,
-    flake_settings: nix_flake::FlakeSettings,
+    fetch_settings: nix_bindings_fetchers::FetchersSettings,
+    flake_settings: nix_bindings_flake::FlakeSettings,
     flakeref_str: &str,
     input_overrides: &Vec<(String, String)>,
 ) -> Result<Value> {
-    let mut parse_flags = nix_flake::FlakeReferenceParseFlags::new(&flake_settings)?;
+    let mut parse_flags = nix_bindings_flake::FlakeReferenceParseFlags::new(&flake_settings)?;
 
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("failed to get current directory: {}", e))?;
@@ -46,10 +46,10 @@ fn get_flake(
 
     let parse_flags = parse_flags;
 
-    let mut lock_flags = nix_flake::FlakeLockFlags::new(&flake_settings)?;
+    let mut lock_flags = nix_bindings_flake::FlakeLockFlags::new(&flake_settings)?;
     lock_flags.set_mode_write_as_needed()?; // TODO: nope, not this.
     for (override_path, override_ref_str) in input_overrides {
-        let (override_ref, fragment) = nix_flake::FlakeReference::parse_with_fragment(
+        let (override_ref, fragment) = nix_bindings_flake::FlakeReference::parse_with_fragment(
             &fetch_settings,
             &flake_settings,
             &parse_flags,
@@ -66,7 +66,7 @@ fn get_flake(
     }
     let lock_flags = lock_flags;
 
-    let (flakeref, fragment) = nix_flake::FlakeReference::parse_with_fragment(
+    let (flakeref, fragment) = nix_bindings_flake::FlakeReference::parse_with_fragment(
         &fetch_settings,
         &flake_settings,
         &parse_flags,
@@ -79,7 +79,7 @@ fn get_flake(
             fragment
         );
     }
-    let flake = nix_flake::LockedFlake::lock(
+    let flake = nix_bindings_flake::LockedFlake::lock(
         &fetch_settings,
         &flake_settings,
         eval_state,
@@ -283,7 +283,7 @@ async fn flack_handler(req: HttpRequest, body: &web::Bytes) -> Result<FlackRespo
 
     let mut response = FlackResponse::new();
 
-    let _gc_guard = nix_expr::eval_state::gc_register_my_thread()
+    let _gc_guard = nix_bindings_expr::eval_state::gc_register_my_thread()
         .map_err(|err| response.server_error(err))?;
 
     let mut st = app.eval_state.get_cloned()
@@ -356,7 +356,7 @@ async fn flack_handler(req: HttpRequest, body: &web::Bytes) -> Result<FlackRespo
         let mut response = response_mutex.get_cloned()
             .map_err(|err| FlackResponse::new().server_error(err))?;
 
-        let _gc_guard = nix_expr::eval_state::gc_register_my_thread()
+        let _gc_guard = nix_bindings_expr::eval_state::gc_register_my_thread()
             .map_err(|err| response.server_error(err))?;
 
         let mut st = eval_state_mutex.get_cloned()
@@ -394,7 +394,7 @@ async fn flack_handler(req: HttpRequest, body: &web::Bytes) -> Result<FlackRespo
         if length != 3 {
             return Err(response.server_error("result of flack.app did not have length 3"));
         }
-        let code_val = match st.require_list_select_idx(&res, 0)
+        let code_val = match st.require_list_select_idx_strict(&res, 0)
             .map_err(|err| response.server_error(err))?
         {
             Some(val) => val,
@@ -406,7 +406,7 @@ async fn flack_handler(req: HttpRequest, body: &web::Bytes) -> Result<FlackRespo
             return Err(response.server_error("invalid status code"));
         }
 
-        let res_headers_value = match st.require_list_select_idx(&res, 1)
+        let res_headers_value = match st.require_list_select_idx_strict(&res, 1)
             .map_err(|err| response.server_error(err))?
         {
             Some(val) => val,
@@ -415,7 +415,7 @@ async fn flack_handler(req: HttpRequest, body: &web::Bytes) -> Result<FlackRespo
         let res_headers_names = st.require_attrs_names(&res_headers_value)
             .map_err(|err| response.server_error(err))?;
 
-        let body = match st.require_list_select_idx(&res, 2)
+        let body = match st.require_list_select_idx_strict(&res, 2)
             .map_err(|err| response.server_error(err))?
         {
             Some(val) => val,
@@ -506,7 +506,7 @@ async fn build_response(req: HttpRequest, response: &FlackResponse) -> HttpRespo
                     builder.body("store path was not a file")
                 }
             },
-            Err(err) => {
+            Err(_err) => {
                 let mut builder = response.to_builder();
                 builder.status(StatusCode::NOT_FOUND);
                 builder.body("error opening file")
@@ -535,7 +535,7 @@ async fn main() -> std::io::Result<()> {
 
     env_logger::init_from_env(env);
 
-    let _gc_guard = nix_expr::eval_state::gc_register_my_thread()
+    let _gc_guard = nix_bindings_expr::eval_state::gc_register_my_thread()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     let max_connections = match std::thread::available_parallelism() {
@@ -549,13 +549,13 @@ async fn main() -> std::io::Result<()> {
     let uri = format!("unix://?max-connections={}", max_connections);
     info!("Initializing with store URI: {}", uri);
 
-    let store = nix_store::store::Store::open(Some(uri.as_str()), [])
+    let store = nix_bindings_store::store::Store::open(Some(uri.as_str()), [])
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let flake_settings = nix_flake::FlakeSettings::new()
+    let flake_settings = nix_bindings_flake::FlakeSettings::new()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let fetch_settings = nix_fetchers::FetchersSettings::new()
+    let fetch_settings = nix_bindings_fetchers::FetchersSettings::new()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let mut eval_state = nix_expr::eval_state::EvalStateBuilder::new(store)
+    let mut eval_state = nix_bindings_expr::eval_state::EvalStateBuilder::new(store)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
         .flakes(&flake_settings)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
@@ -577,7 +577,7 @@ async fn main() -> std::io::Result<()> {
         let eval_data = eval_mutex.get_cloned();
         let app = FlackApp {
             address, port,
-            system: nix_util::settings::get("system").unwrap_or("unknown".to_string()),
+            system: nix_bindings_util::settings::get("system").unwrap_or("unknown".to_string()),
             flake: flake_data.expect("no flake"),
             eval_state: Arc::new(Mutex::<EvalState>::new(eval_data.expect("no eval state")))
         };
