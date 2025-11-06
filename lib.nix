@@ -173,6 +173,7 @@ rec {
           # Express-compatible attributes.
           inherit app env;
           params = { };
+          body = env."flack.body" or { };
           host = env.HTTP_HOST;
           method = env.REQUEST_METHOD;
           path = env.PATH_INFO;

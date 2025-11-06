@@ -1,21 +1,27 @@
 {
   description = "Serve your flakes";
   inputs = {
+    nix.url = "github:DeterminateSystems/nix-src";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs-25_05.url = "github:NixOS/nixpkgs/nixos-25.05";
     nixpkgs-lib.url = "github:numinit/nixpkgs.lib";
     flake-parts.url = "github:hercules-ci/flake-parts";
     flake-compat.url = "https://flakehub.com/f/edolstra/flake-compat/1.tar.gz";
     flakever.url = "github:numinit/flakever";
     nix-cargo-integration.url = "github:90-008/nix-cargo-integration";
     nix-bindings-rust.url = "github:numinit/nix-bindings-rust";
+
+    nixos-search.url = "github:NixOS/nixos-search";
   };
 
   outputs =
     inputs@{
       self,
+      nix,
       nixpkgs-lib,
       flake-parts,
       flakever,
+      nixos-search,
       ...
     }:
     let
@@ -84,7 +90,7 @@
             };
           };
 
-          nix-bindings-rust.nixPackage = pkgs.nixVersions.latest;
+          nix-bindings-rust.nixPackage = nix.packages.${system}.default;
 
           nci.projects."flack" = rec {
             path = ./rust;
@@ -98,9 +104,8 @@
 
           overlayAttrs = {
             flack = outputs."flack".packages.release;
+            nixos-search-frontend = nixos-search.packages.${system}.frontend;
           };
-
-          legacyPackages = pkgs;
 
           packages = {
             default = pkgs.flack;
@@ -112,7 +117,9 @@
           };
 
           devShells = {
-            default = outputs."flack".devShell;
+            default = outputs."flack".devShell.overrideAttrs (prev: {
+              buildInputs = prev.buildInputs or [ ] ++ [ pkgs.gdb ];
+            });
           };
         };
     };

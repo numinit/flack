@@ -6,6 +6,7 @@
 }:
 
 {
+  imports = [ ./search.nix ];
   mount = {
     "/pkgs" = {
       route.GET."/:...path" =
@@ -27,7 +28,6 @@
       req: if req.get "X-Auth-Token" != "supersecret" then req.res 401 { } "Unauthorized" else req;
   };
   route = {
-    GET."/" = req: req.res 200 { "hello" = "world"; };
     GET."/foo/:bar" =
       req:
       req.res 200 { } {

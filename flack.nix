@@ -90,7 +90,7 @@ let
     foldl (
       s: x:
       let
-        isSplat = length s > 0 && (elemAt s (length s - 1)).splat;
+        isSplat = length s > 0 && (elemAt s (length s - 1)).splat';
         isLast = length x == length pathComponents;
         componentMatch = matchRoutePlaceholder (elemAt x (length x - 1));
         thePath =

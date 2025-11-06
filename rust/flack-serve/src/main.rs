@@ -1,8 +1,11 @@
 #![feature(lock_value_accessors)]
 #![feature(normalize_lexically)]
 
-use log::{debug, info, warn, error};
+use actix_web::mime::{self};
+use log::{debug, info, warn};
+use nix_bindings_expr::eval_state::ThreadRegistrationGuard;
 use std::num::NonZero;
+use std::ops::Deref;
 use std::path::{PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -11,7 +14,7 @@ use std::{sync::Arc};
 use actix_files::NamedFile;
 use actix_web::http::header::{HeaderName, HeaderValue, TryIntoHeaderPair};
 use actix_web::http::{header, StatusCode};
-use actix_web::{Either, HttpRequest, HttpResponseBuilder};
+use actix_web::{Either, HttpMessage, HttpRequest, HttpResponseBuilder};
 use actix_web::{
     web, App, HttpResponse, HttpServer
 };
@@ -27,7 +30,7 @@ use nix_bindings_expr::{
 use nix_bindings_flake::EvalStateBuilderExt as _;
 
 use nix_bindings_store::path::StorePath;
-use nix_bindings_store::store::Store;
+use nix_bindings_store::store::{Store, StoreWeak};
 
 #[derive(Parser, Clone, Debug)]
 #[command(version, about, long_about = None)]
@@ -71,10 +74,10 @@ struct FlackArgs {
 
 pub struct FlackApp {
     args: FlackArgs,
-    attr: Vec<String>,
     system: String,
-    flake: Value,
-    eval_state: Arc<Mutex<EvalState>>
+    state: Arc<Mutex<EvalState>>,
+    flake: Arc<Mutex<Value>>,
+    app: Arc<Mutex<Value>>,
 }
 
 #[derive(Clone, Debug)]
@@ -85,14 +88,41 @@ struct FlackResponse {
     body_path: Option<PathBuf>
 }
 
+fn get_gc_guard() -> std::io::Result<ThreadRegistrationGuard> {
+    nix_bindings_expr::eval_state::init()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    nix_bindings_expr::eval_state::gc_register_my_thread()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+}
+
+fn get_state(
+    store: Store
+) -> std::io::Result<(EvalState, ThreadRegistrationGuard)> {
+    let gc_guard = get_gc_guard()?;
+
+    let flake_settings = nix_bindings_flake::FlakeSettings::new()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let state = nix_bindings_expr::eval_state::EvalStateBuilder::new(store)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .flakes(&flake_settings)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .build()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    Ok((state, gc_guard))
+}
+
 fn get_flake(
     eval_state: &mut EvalState,
     fetch_settings: nix_bindings_fetchers::FetchersSettings,
-    flake_settings: nix_bindings_flake::FlakeSettings,
     basedir_str: &String,
     flakeref_str: &String,
     input_overrides: &Vec<(String, String)>,
 ) -> std::io::Result<Value> {
+    let flake_settings = nix_bindings_flake::FlakeSettings::new()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
     let mut parse_flags = nix_bindings_flake::FlakeReferenceParseFlags::new(&flake_settings)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
@@ -203,6 +233,10 @@ impl FlackResponse {
         self.set(500, Either::Left(err.to_string()))
     }
 
+    fn bad_request<S: std::fmt::Display>(&mut self, err: S) -> Self {
+        self.set(400, Either::Left(err.to_string()))
+    }
+
     fn not_found<S: std::fmt::Display>(&mut self, err: S) -> Self {
         self.set(404, Either::Left(err.to_string()))
     }
@@ -304,7 +338,6 @@ fn get_safe_path(
 fn serve_path_or_text(
     response: &mut FlackResponse,
     st: &mut EvalState,
-    store: &mut Store,
     dir: &String,
     value: &Value
 ) -> Result<FlackResponse, FlackResponse> {
@@ -317,7 +350,8 @@ fn serve_path_or_text(
         .map_err(|err| response.server_error(err))?;
 
     // Could be a string that represents a store path.
-    match get_safe_path(response, store, &string_value) {
+    let mut store = st.store().clone();
+    match get_safe_path(response, &mut store, &string_value) {
         Ok((base_path, path, store_path)) => {
             debug!("Realising store path {:?}", base_path);
             st.realise_string(&to_string_value, false)
@@ -335,113 +369,130 @@ fn serve_path_or_text(
     }
 }
 
-async fn flack_handler(req: HttpRequest, body: &web::Bytes) -> Result<FlackResponse, FlackResponse> {
-    let app = req.app_data::<web::Data<FlackApp>>().unwrap();
-    let dir = app.args.dir.clone();
+async fn flack_handler(req: HttpRequest, request_body: web::Bytes) -> Result<FlackResponse, FlackResponse> {
+    let app = req.app_data::<web::Data<FlackApp>>().unwrap().clone();
+
     let port = app.args.port;
-    let attr = app.attr.clone();
-    let system = app.system.as_str();
 
-    let mut response = FlackResponse::new();
-
-    let _gc_guard = nix_bindings_expr::eval_state::gc_register_my_thread()
-        .map_err(|err| response.server_error(err))?;
-
-    let mut st = app.eval_state.get_cloned()
-        .map_err(|err| response.server_error(err))?;
-
-    let connection_info = req.connection_info();
     let http_version = format!("{:?}", req.version());
     let request_id = Uuid::now_v7().to_string();
     let str_inputs = [
-        ("RACK", "flack"),
-        ("REQUEST_METHOD", req.method().as_str()),
-        ("PATH_INFO", req.path()),
-        ("QUERY_STRING", req.query_string()),
-        ("SERVER_NAME", connection_info.host()),
-        ("SERVER_PROTOCOL", http_version.as_str()),
-        ("rack.url_scheme", connection_info.scheme()),
-        ("flack.system", system),
-        ("flack.request_id", request_id.as_str())
+        ("RACK", "flack".to_string()),
+        ("REQUEST_METHOD", req.method().to_string()),
+        ("PATH_INFO", req.path().to_string()),
+        ("QUERY_STRING", req.query_string().to_string()),
+        ("SERVER_NAME", req.connection_info().host().to_string()),
+        ("SERVER_PROTOCOL", http_version.to_string()),
+        ("rack.url_scheme", req.connection_info().scheme().to_string()),
+        ("flack.system", app.system.to_string()),
+        ("flack.request_id", request_id),
     ];
     let int_inputs = [
         ("SERVER_PORT", port as i64),
     ];
 
-    let mut pairs = Vec::with_capacity(str_inputs.len() + int_inputs.len());
-    for (key, value) in str_inputs {
-        add_str_value(&mut response, &mut st, &mut pairs, key, value)?;
-    }
-    for (key, value) in int_inputs {
-        add_int_value(&mut response, &mut st, &mut pairs, key, value)?;
-    }
-
-    match req.headers().get("host") {
-        Some(v) => add_str_value(&mut response, &mut st, &mut pairs, "HTTP_HOST", v.to_str().unwrap_or("")),
-        None => Ok(())
-    }?;
-
-    match req.headers().get("content-type") {
-        Some(v) => add_str_value(&mut response, &mut st, &mut pairs, "CONTENT_TYPE", v.to_str().unwrap_or("")),
-        None => Ok(())
-    }?;
-
-    if !body.is_empty() {
-        add_int_value(&mut response, &mut st, &mut pairs, "CONTENT_LENGTH", body.len() as i64)?;
-    }
-
-    for (key, value) in req.headers().iter() {
-        if key.as_str().eq("host") || key.as_str().eq("content-type") {
-            continue;
-        }
-
-        let key_str = key.as_str();
-        if key_str.chars().all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '-')) {
-            let env_str = format!("HTTP_{}", key_str.to_ascii_uppercase().replace("-", "_"));
-            add_str_value(&mut response, &mut st, &mut pairs, &env_str, value.to_str().unwrap_or(""))?;
-        }
-    }
-
-    let eval_state_mutex = app.eval_state.clone();
-    let response_mutex = Arc::new(Mutex::<FlackResponse>::new(response.clone()));
-    let flake_mutex = Arc::new(Mutex::<Value>::new(app.flake.clone()));
-    let env_mutex = Arc::new(
-        Mutex::<Value>::new(
-            st.new_value_attrs(pairs)
-                .map_err(|err| response.server_error(err))?
-        )
-    );
+    let headers = req.headers().clone();
+    let mime_type = req.mime_type();
+    let request_body_mutex = Arc::new(Mutex::<web::Bytes>::new(request_body));
 
     // Offload eval once we've assembled the request context, since it will block.
     web::block(move || {
-        let mut response = response_mutex.get_cloned()
-            .map_err(|err| FlackResponse::new().server_error(err))?;
+        let _guard = get_gc_guard();
 
-        let _gc_guard = nix_bindings_expr::eval_state::gc_register_my_thread()
+        let dir = app.args.dir.clone();
+
+        let mut response = FlackResponse::new();
+
+        let mut st = app.state.get_cloned()
             .map_err(|err| response.server_error(err))?;
 
-        let mut st = eval_state_mutex.get_cloned()
-            .map_err(|err| response.server_error(err))?;
-
-        let mut store = st.store().clone();
-
-        let mut app = flake_mutex.get_cloned()
-            .map_err(|err| response.server_error(err))?;
-
-        for item in &attr {
-            app = match st
-                .require_attrs_select_opt(&app, item)
-                .map_err(|err| response.not_found(err))?
-            {
-                Some(v) => v,
-                None => return Err(response.not_found(format!("attribute '{}' not found", item))),
-            };
+        let mut pairs = Vec::with_capacity(str_inputs.len() + int_inputs.len() + 1);
+        for (key, value) in str_inputs {
+            add_str_value(&mut response, &mut st, &mut pairs, key, value.as_str())?;
+        }
+        for (key, value) in int_inputs {
+            add_int_value(&mut response, &mut st, &mut pairs, key, value)?;
         }
 
-        let env = env_mutex.get_cloned()
+        match headers.get("host") {
+            Some(v) => add_str_value(&mut response, &mut st, &mut pairs, "HTTP_HOST", v.to_str().unwrap_or("")),
+            None => Ok(())
+        }?;
+
+        match headers.get("content-type") {
+            Some(v) => add_str_value(&mut response, &mut st, &mut pairs, "CONTENT_TYPE", v.to_str().unwrap_or("")),
+            None => Ok(())
+        }?;
+
+        let request_body = request_body_mutex.get_cloned()
             .map_err(|err| response.server_error(err))?;
 
-        let res = st.call(app, env)
+        if !request_body.is_empty() {
+            add_int_value(&mut response, &mut st, &mut pairs, "CONTENT_LENGTH", request_body.len() as i64)?;
+
+            let json_body = match mime_type {
+                Ok(v) => {
+                    match v {
+                        Some(mime) => {
+                            match (mime.type_(), mime.subtype()) {
+                                (mime::APPLICATION, mime::JSON) => {
+                                    let request_body_str = std::str::from_utf8(&request_body);
+                                    match request_body_str {
+                                        Ok(request_body) => {
+                                            Some(request_body)
+                                        },
+                                        Err(err) => {
+                                            return Err(response.bad_request(err));
+                                        }
+                                    }
+                                },
+                                _ => None
+                            }
+                        },
+                        None => None
+                    }
+                },
+                Err(err) => {
+                    return Err(response.bad_request(err));
+                }
+            };
+
+            match json_body {
+                Some(body) => {
+                    let from_json = st.eval_from_string("builtins.fromJSON", dir.as_str())
+                        .map_err(|err| response.server_error(err))?;
+                    let body_val = st.new_value_str(body)
+                        .map_err(|err| response.bad_request(err))?;
+                    debug!("fromJSON on body");
+                    let body_attrset_val = st.call(from_json, body_val)
+                        .map_err(|err| response.bad_request(err))?;
+                    pairs.push(("flack.body".to_string(), body_attrset_val));
+                    ()
+                },
+                None => ()
+            }
+        }
+
+        for (key, value) in headers.iter() {
+            if key.as_str().eq("host") || key.as_str().eq("content-type") {
+                continue;
+            }
+
+            let key_str = key.as_str();
+            if key_str.chars().all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '-')) {
+                let env_str = format!("HTTP_{}", key_str.to_ascii_uppercase().replace("-", "_"));
+                add_str_value(&mut response, &mut st, &mut pairs, &env_str, value.to_str().unwrap_or(""))?;
+            }
+        }
+
+        let env = st.new_value_attrs(pairs)
+            .map_err(|err| response.server_error(err))?;
+
+        debug!("calling into app");
+        let flack_app = app.app.get_cloned()
+            .map_err(|err| response.server_error(err))?;
+
+        let res = st.call(flack_app, env)
             .map_err(|err| response.server_error(err))?;
 
         let length = st.require_list_size(&res)
@@ -499,7 +550,7 @@ async fn flack_handler(req: HttpRequest, body: &web::Bytes) -> Result<FlackRespo
         }
 
         if body_type == ValueType::String {
-            serve_path_or_text(&mut response, &mut st, &mut store, &dir, &body)
+            serve_path_or_text(&mut response, &mut st, &dir, &body)
         } else if body_type == ValueType::AttrSet {
             // Could be a derivation.
             let attrs_type = match st.require_attrs_select_opt(&body, "type") {
@@ -513,11 +564,12 @@ async fn flack_handler(req: HttpRequest, body: &web::Bytes) -> Result<FlackRespo
                 Err(_) => "attrs".to_string(),
             };
             if attrs_type.as_str().eq("derivation") {
-                serve_path_or_text(&mut response, &mut st, &mut store, &dir, &body)
+                serve_path_or_text(&mut response, &mut st, &dir, &body)
             } else {
                 // Normal attrset, try to coerce to JSON
                 let to_json = st.eval_from_string("builtins.toJSON", dir.as_str())
                     .map_err(|err| response.server_error(err))?;
+                debug!("toJSON on result");
                 let json_str_value = st.call(to_json, body)
                     .map_err(|err| response.server_error(err))?;
                 let json_str = st.require_string(&json_str_value)
@@ -575,7 +627,7 @@ async fn build_response(req: HttpRequest, response: &FlackResponse) -> HttpRespo
 }
 
 async fn flack(req: HttpRequest, body: web::Bytes) -> actix_web::Result<HttpResponse> {
-    match flack_handler(req.clone(), &body).await
+    match flack_handler(req.clone(), body).await
     {
         Ok(response) => Ok(build_response(req.clone(), &response).await),
         Err(response) => Ok(build_response(req.clone(), &response).await)
@@ -612,9 +664,6 @@ async fn main() -> std::io::Result<()> {
         &[("max-connections", format!("{}", args.max_connections).as_str())])
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-    let _gc_guard = nix_bindings_expr::eval_state::gc_register_my_thread()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
     info!("Connecting to store: {}", store_uri.to_string());
 
     let store = nix_bindings_store::store::Store::open(Some(store_uri.to_string().as_str()), [])
@@ -622,44 +671,57 @@ async fn main() -> std::io::Result<()> {
 
     info!("Loading flake: {}", args.flake);
 
-    let flake_settings = nix_bindings_flake::FlakeSettings::new()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let fetch_settings = nix_bindings_fetchers::FetchersSettings::new()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let mut eval_state = nix_bindings_expr::eval_state::EvalStateBuilder::new(store)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
-        .flakes(&flake_settings)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
-        .build()
+    let (mut st, _guard) = get_state(store)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-    let flake = get_flake(&mut eval_state, fetch_settings, flake_settings, &args.dir, &args.flake, &std::vec::Vec::new())?;
+    // Get the flake.
+    let fetch_settings = nix_bindings_fetchers::FetchersSettings::new()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let flake = get_flake(&mut st, fetch_settings, &args.dir, &args.flake, &std::vec::Vec::new())?;
 
     info!(
         "Flake loaded successfully: {:?}",
-        eval_state.require_attrs_names(&flake)
+        st.require_attrs_names(&flake)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
     );
+
+    // Get the app.
+    let mut app = flake.clone();
+
+    let attr: Vec<String> = args.attr.split('.').map(str::to_string).collect();
+    for item in &attr {
+        app = match st
+            .require_attrs_select_opt(&app, item)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?
+        {
+            Some(v) => v,
+            None => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("attribute '{}' not found", item))),
+        };
+    }
+
+    info!("App loaded successfully.");
 
     let host = args.host.clone();
     let log_host = args.host.clone();
     let port = args.port.clone();
 
     let args_mutex = Arc::new(Mutex::<FlackArgs>::new(args));
+    let state_mutex = Arc::new(Mutex::<EvalState>::new(st.clone()));
     let flake_mutex = Arc::new(Mutex::<Value>::new(flake));
-    let eval_mutex = Arc::new(Mutex::<EvalState>::new(eval_state));
+    let app_mutex = Arc::new(Mutex::<Value>::new(app));
 
     let server = HttpServer::new(move || {
         let args_data = args_mutex.get_cloned().expect("no args");
+        let state_data = state_mutex.get_cloned().expect("no state");
         let flake_data = flake_mutex.get_cloned().expect("no flake");
-        let eval_data = eval_mutex.get_cloned();
-        let attr = args_data.attr.split('.').map(str::to_string).collect();
+        let app_data = app_mutex.get_cloned().expect("no app");
+
         let app = FlackApp {
             args: args_data,
-            attr,
             system: nix_bindings_util::settings::get("system").unwrap_or("unknown".to_string()),
-            flake: flake_data,
-            eval_state: Arc::new(Mutex::<EvalState>::new(eval_data.expect("no eval state")))
+            state: Arc::new(Mutex::<EvalState>::new(state_data)),
+            flake: Arc::new(Mutex::<Value>::new(flake_data)),
+            app: Arc::new(Mutex::<Value>::new(app_data))
         };
 
         App::new()
