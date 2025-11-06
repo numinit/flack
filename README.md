@@ -8,5 +8,7 @@ and provides a web router API written in Nix that works like [Express](https://e
 ## Examples
 
 - Check out the example app in `apps/default.nix`
-- Run: `nix run github:NixVegas/flack -- --flake github:NixVegas/flack`
-- Clone, and `nix run`
+- Run by either:
+    - `nix run github:NixVegas/flack -- --flake github:NixVegas/flack`
+    - Cloning, and `nix run`
+- Browse to https://localhost:2019 and try an implementation of search.nixos.org in pure Nix
