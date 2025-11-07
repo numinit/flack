@@ -14,8 +14,8 @@ That being said, the module system API for Flack apps is likely fairly consisten
 ## Examples
 
 Check out the example app in [apps/default.nix](https://github.com/numinit/flack/blob/master/apps/default.nix).
-It contains a full search.nixos.org implementation, as well as examples of sandboxed CGI scripts, mounts, middlewares,
-and normal routes.
+It contains a partial search.nixos.org implementation, as well as examples of sandboxed CGI scripts, mounts,
+middlewares, and normal routes.
 
 - Run it by either:
     - `nix run github:numinit/flack -- --flake github:numinit/flack`
