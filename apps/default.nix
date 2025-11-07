@@ -67,7 +67,6 @@
           '';
       in
       {
-        #
         route.GET = {
           "/now.cgi" =
             req:
@@ -85,6 +84,7 @@
     /*
       This is a middleware.
       If X-Auth-Token isn't "supersecret" then it'll return a 401 for all paths under /foo.
+      Obviously there is a timing sidechannel here, don't actually do this.
     */
     "/foo" =
       req: if req.get "X-Auth-Token" != "supersecret" then req.res 401 { } "Unauthorized" else req;
