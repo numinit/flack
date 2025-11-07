@@ -9,10 +9,15 @@ and provides a web router API written in Nix that works like [Express](https://e
 
 Everything in this repo is subject to change. Don't put it into prod!
 
+That being said, the module system API for Flack apps is likely fairly consistent.
+
 ## Examples
 
-- Check out the example app in `apps/default.nix`
-- Run by either:
+Check out the example app in [apps/default.nix](https://github.com/numinit/flack/blob/master/apps/default.nix).
+It contains a full search.nixos.org implementation, as well as examples of sandboxed CGI scripts, mounts, middlewares,
+and normal routes.
+
+- Run it by either:
     - `nix run github:numinit/flack -- --flake github:numinit/flack`
     - Cloning, and `nix run`
-- Browse to https://localhost:2019 and try an implementation of search.nixos.org in pure Nix
+- Browse to http://localhost:2019 and try an implementation of search.nixos.org in pure Nix

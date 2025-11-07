@@ -80,12 +80,21 @@ pub struct FlackApp {
     app: Arc<Mutex<Value>>,
 }
 
+#[derive(serde::Serialize, Clone, Debug)]
+struct FlackError {
+    error: String,
+
+    #[serde(skip_serializing)]
+    long: String
+}
+
 #[derive(Clone, Debug)]
 struct FlackResponse {
     code: u16,
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Option<String>,
-    body_path: Option<PathBuf>
+    body_path: Option<PathBuf>,
+    error: Option<FlackError>
 }
 
 fn get_gc_guard() -> std::io::Result<ThreadRegistrationGuard> {
@@ -196,7 +205,13 @@ fn get_flake(
 
 impl FlackResponse {
     fn new() -> FlackResponse {
-        FlackResponse { code: 0, headers: Vec::new(), body: None, body_path: None }
+        FlackResponse {
+            code: 0,
+            headers: Vec::new(),
+            body: None,
+            body_path: None,
+            error: None
+        }
     }
 
     fn to_builder(&self) -> HttpResponseBuilder {
@@ -230,37 +245,44 @@ impl FlackResponse {
     }
 
     fn server_error<S: std::fmt::Display>(&mut self, err: S) -> Self {
-        self.set(500, Either::Left(err.to_string()))
+        self.set(500, Either::Left(FlackError{ error: "Internal server error".to_string(), long: err.to_string() }))
     }
 
     fn bad_request<S: std::fmt::Display>(&mut self, err: S) -> Self {
-        self.set(400, Either::Left(err.to_string()))
+        self.set(400, Either::Left(FlackError{ error: "Bad request".to_string(), long: err.to_string() }))
     }
 
     fn not_found<S: std::fmt::Display>(&mut self, err: S) -> Self {
-        self.set(404, Either::Left(err.to_string()))
+        self.set(404, Either::Left(FlackError{ error: "Not found".to_string(), long: err.to_string() }))
     }
 
-    fn ok(&mut self, body: Either<String, PathBuf>) -> Self {
+    fn ok(&mut self, body: Either<FlackError, Either<String, PathBuf>>) -> Self {
         self.set(200, body)
     }
 
     fn ok_string<S: std::fmt::Display>(&mut self, body: S) -> Self {
-        self.ok(Either::Left(body.to_string()))
+        self.ok(Either::Right(Either::Left(body.to_string())))
     }
 
     fn ok_path(&mut self, body: PathBuf) -> Self {
-        self.ok(Either::Right(body))
+        self.ok(Either::Right(Either::Right(body)))
     }
 
-    fn set(&mut self, code: u16, body: Either<String, PathBuf>) -> Self {
+    fn set(&mut self, code: u16, body: Either<FlackError, Either<String, PathBuf>>) -> Self {
         self.code = code;
         match body {
             Either::Left(left) => {
-                self.body = Some(left.to_owned());
+                self.error = Some(left.to_owned());
             },
             Either::Right(right) => {
-                self.body_path = Some(right.to_owned());
+                match right {
+                    Either::Left(left) => {
+                        self.body = Some(left.to_owned());
+                    },
+                    Either::Right(right) => {
+                        self.body_path = Some(right.to_owned());
+                    }
+                }
             }
         };
         self.clone()
@@ -608,21 +630,29 @@ async fn build_response(req: HttpRequest, response: &FlackResponse) -> HttpRespo
                     response.headers_into_response(&mut res);
                     res
                 } else {
-                    let mut builder = response.to_builder();
-                    builder.status(StatusCode::NOT_FOUND);
-                    builder.body("store path was not a file")
+                    let cloned_response = response.clone().not_found("store path was not a file");
+                    let error = cloned_response.error.as_ref().unwrap();
+                    warn!("Error ({}): {}", error.error, error.long);
+                    let mut builder = cloned_response.to_builder();
+                    builder.status(StatusCode::from_u16(cloned_response.code).unwrap());
+                    builder.json(web::Json(error))
                 }
             },
             Err(_err) => {
-                let mut builder = response.to_builder();
-                builder.status(StatusCode::NOT_FOUND);
-                builder.body("error opening file")
+                let cloned_response = response.clone().not_found("cannot open file");
+                let error = cloned_response.error.as_ref().unwrap();
+                warn!("Error ({}): {}", error.error, error.long);
+                let mut builder = cloned_response.to_builder();
+                builder.status(StatusCode::from_u16(cloned_response.code).unwrap());
+                builder.json(web::Json(error))
             }
         }
     } else {
+        let error = response.error.as_ref().unwrap();
+        warn!("Error ({}): {}", error.error, error.long);
         let mut builder = response.to_builder();
-        builder.status(StatusCode::INTERNAL_SERVER_ERROR);
-        builder.body("neither body string nor path was set")
+        builder.status(StatusCode::from_u16(response.code).unwrap());
+        builder.json(web::Json(error))
     }
 }
 

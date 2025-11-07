@@ -43,6 +43,8 @@ let
 in
 {
   route = rec {
+    # These allow us to serve a static site with Flack.
+    # In all cases, the nixos-search frontend is built on-demand and a path under it is served.
     GET."/" = req: req.res 200 { } (getFrontend req "/index.html");
     GET."/packages" = GET."/";
     GET."/:...path" = req: req.res 200 { } (getFrontend req req.path);
@@ -50,6 +52,7 @@ in
 
   mount = {
     "/backend" = {
+      # This implements package search using a hacky subset of the Elastic API.
       route.POST."/:version/_search" =
         req:
         let
@@ -71,9 +74,12 @@ in
               ) (coerceList (req.body.query.bool.must or [ ]))
             )
           );
+
+          # Parse pagination params.
           size = max 0 (min 50 (coerceInt (req.body.size or 50)));
           from = max 0 (coerceInt (req.body.from or 0));
 
+          # Select the package set.
           packageSet =
             version:
             let
@@ -86,8 +92,12 @@ in
             else
               "nixpkgs";
 
+          # Get the package set and eval them.
           pkgs = self.inputs.${packageSet (req.params.version or null)}.legacyPackages.${req.system};
           pkgsThatEval = packagesUnder [ ] (_: _: true) pkgs;
+
+          # Compute matches using a pretty rudimentary algorithm.
+          # TODO: extend to other package sets, and use a trigram index for sub-O(n).
           matches = filter (x: all (q: hasInfix q (toLower x.attrPath)) query) pkgsThatEval;
           resultsList = map (x: nameValuePair x.attrPath x.package) matches;
           results = listToAttrs resultsList;
@@ -98,6 +108,7 @@ in
             email = maintainer.email or "";
           };
 
+          # Creates the derivation position by stripping the store prefix.
           toPosition =
             position:
             let
@@ -105,6 +116,7 @@ in
             in
             if position == null || matchResult == null then null else head matchResult;
 
+          # Creates a license list.
           toLicenses =
             licenses:
             if isList licenses then
@@ -117,6 +129,7 @@ in
             else
               singleton licenses;
 
+          # Creates a package source.
           mkSource =
             {
               name,
@@ -157,6 +170,7 @@ in
               package_position = toPosition (package.meta.position or null);
             };
 
+          # Creates a "hit" in Elasticsearch parlance.
           mkHit =
             name: value:
             let
@@ -193,20 +207,27 @@ in
         req.res 200 {
           took = 1;
           timed_out = false;
+
+          # Not sure what to put here... one shard, zero failed sounds reasonable.
           _shards = {
             total = 1;
             successful = 1;
             skipped = 0;
             failed = 0;
           };
+
           hits = {
             total = {
               value = length resultsList;
               relation = "eq";
             };
             max_score = null;
+
+            # Paginate the matched packages.
             hits = sublist from size (mapAttrsToList mkHit results);
           };
+
+          # TODO: implement aggregations.
           aggregations = {
             all = {
               doc_count = length pkgsThatEval;
