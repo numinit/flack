@@ -35,19 +35,28 @@ let
 
   inherit (lib.attrsets) listToAttrs nameValuePair mapAttrsToList;
 
+  inherit (flack.lib.paths) joinPath;
+
   packagesUnder = import ./eval-packages.nix {
     inherit lib;
   };
 
-  getFrontend = req: path: "${self.inputs.nixos-search.packages.${req.system}.frontend}${path}";
+  getFrontend =
+    req: path:
+    let
+      pathOrIndex = if path == "/" then "/index.html" else path;
+    in
+    "${self.inputs.nixos-search.packages.${req.system}.frontend}${pathOrIndex}";
 in
 {
   route = rec {
     # These allow us to serve a static site with Flack.
     # In all cases, the nixos-search frontend is built on-demand and a path under it is served.
-    GET."/" = req: req.res 200 { } (getFrontend req "/index.html");
+    GET."/" = req: req.res 200 { } (getFrontend req "/");
     GET."/packages" = GET."/";
-    GET."/:...path" = req: req.res 200 { } (getFrontend req req.path);
+    GET."/options" = GET."/";
+    GET."/flakes" = GET."/";
+    GET."/:...path" = req: req.res 200 { } (getFrontend req (joinPath req.params.path));
   };
 
   mount = {

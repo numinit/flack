@@ -53,6 +53,12 @@
           in
           flack
           // {
+            apps.simple = flack.mkApp {
+              route = {
+                GET."/" = req: req.res 200 "Hello, Flack!";
+              };
+            };
+
             apps.default = flack.mkApp {
               modules = [ ./apps ];
               specialArgs = {

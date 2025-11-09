@@ -5,19 +5,19 @@ let
 
   inherit (lib.strings)
     hasSuffix
-    match
+    optionalString
     ;
 
   inherit (lib.lists)
     isList
     length
+    optional
     singleton
     elemAt
     foldl
     flatten
     toposort
     sublist
-    dropEnd
     genList
     ;
 
@@ -27,6 +27,7 @@ let
     foldlAttrs
     mapAttrs
     mapAttrsToList
+    optionalAttrs
     updateManyAttrsByPath
     ;
 
@@ -93,6 +94,7 @@ let
         isSplat = length s > 0 && (elemAt s (length s - 1)).splat';
         isLast = length x == length pathComponents;
         componentMatch = matchRoutePlaceholder (elemAt x (length x - 1));
+        mkPath = map (val: optionalString (matchRoutePlaceholder val == null) val);
         thePath =
           if isSplat || componentMatch == null && !isLast then
             # We already have the last path component, or this is a normal path component.
@@ -106,7 +108,7 @@ let
               type' = "middleware";
               param' = elemAt componentMatch 1;
               splat' = willBeLast;
-              path' = dropEnd 1 x ++ singleton "";
+              path' = mkPath x;
               __functor =
                 self: req:
                 let
@@ -137,7 +139,7 @@ let
               type' = "middleware";
               param' = null;
               splat' = false;
-              path' = x;
+              path' = mkPath x;
               __functor = _: handler;
             }
           else
@@ -190,7 +192,18 @@ let
         method:
         mapAttrs (
           path: routeFn: req:
-          if req.method == method && length req.pathComponents == length (splitPath prefix path) then
+          let
+            numReqComponents = length req.pathComponents;
+            numPathComponents = length (splitPath prefix path);
+            isSplat = req.app ? splat' && req.app.splat' == true;
+          in
+          if
+            req.method == method
+            && (
+              isSplat && numReqComponents >= numPathComponents
+              || !isSplat && numReqComponents == numPathComponents
+            )
+          then
             execMiddleware req routeFn
           else
             # Next middleware
@@ -242,7 +255,7 @@ let
         in
         if finalRes.type == "req" then
           # Unhandled; do so...
-          (finalRes.res 404 { } "Not found").flack
+          (finalRes.res 404 { } { error = "No handler for route"; }).flack
         else
           finalRes.flack;
     };
@@ -250,13 +263,26 @@ let
   flack = {
     mkApp =
       {
-        modules,
+        modules ? [ ],
         specialArgs ? { },
+        mount ? { },
+        use ? { },
+        route ? { },
       }:
       let
+        implicitModule =
+          optionalAttrs (mount != { }) {
+            inherit mount;
+          }
+          // optionalAttrs (use != { }) {
+            inherit use;
+          }
+          // optionalAttrs (route != { }) {
+            inherit route;
+          };
         providedModules = if isList modules then modules else singleton modules;
         evalResult = evalModules {
-          modules = [ ./module.nix ] ++ providedModules;
+          modules = [ ./module.nix ] ++ providedModules ++ optional (implicitModule != { }) implicitModule;
           specialArgs = specialArgs // {
             inherit flack;
           };

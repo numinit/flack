@@ -3,7 +3,26 @@
 Write web applications using your [favorite reproducible configuration language](https://nixos.org).
 
 Flack serves an HTTP server from your flakes using a [Rack](https://rack.github.io/rack/main/SPEC_rdoc.html)-inspired CGI gateway,
-and provides a web router API written in Nix that works like [Express](https://expressjs.com/).
+and provides a web router API written in Nix that works like [Express](https://expressjs.com/) and [Sinatra](https://sinatrarb.com/).
+
+```nix
+# flake.nix
+# Run with `nix run github:numinit/flack` and visit http://localhost:2020
+{
+    inputs.flack.url = "github:numinit/flack";
+
+    outputs = { flack, ... }: {
+        flack.apps.default = flack.mkApp {
+            route = {
+                GET."/" = req: req.res 200 "Hello, Flack!";
+            };
+        };
+
+        # In case you want `nix run` to work on your local flake, too:
+        inherit (flack) apps;
+    };
+}
+```
 
 ## Experimental
 
@@ -20,4 +39,4 @@ middlewares, and normal routes.
 - Run it by either:
     - `nix run github:numinit/flack -- --flake github:numinit/flack`
     - Cloning, and `nix run`
-- Browse to http://localhost:2019 and try an implementation of search.nixos.org in pure Nix
+- Browse to http://localhost:2020 and try an implementation of search.nixos.org in pure Nix

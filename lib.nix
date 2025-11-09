@@ -5,6 +5,7 @@ let
     toUpper
     replaceStrings
     splitString
+    concatStringsSep
     concatMapStringsSep
     hasPrefix
     hasSuffix
@@ -118,6 +119,9 @@ rec {
       prefix: path:
       singleton "/" ++ tail (splitString "/" (removeSuffix "/" (mkNormalizedPath prefix path)));
 
+    # Joins the specified path.
+    joinPath = path: normalizePath ("/" + concatStringsSep "/" path);
+
     # Matches a path component.
     matchPathComponent = match "^[^/]+$";
 
@@ -217,7 +221,6 @@ rec {
                     ];
                   }
                 else if self.stage < headers then
-                  assert isAttrs codeHeadersOrBody;
                   self
                   // rec {
                     stage = self.stage + 1;

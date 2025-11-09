@@ -1,22 +1,27 @@
+//     ________    ___   ________ __
+//    / ____/ /   /   | / ____/ //_/
+//   / /_  / /   / /| |/ /   / ,<
+//  / __/ / /___/ ___ / /___/ /| |
+// /_/   /_____/_/  |_\____/_/ |_|
+
 #![feature(lock_value_accessors)]
 #![feature(normalize_lexically)]
 
-use actix_web::mime::{self};
-use log::{debug, info, warn};
-use nix_bindings_expr::eval_state::ThreadRegistrationGuard;
-use std::num::NonZero;
-use std::ops::Deref;
+use std::num::{NonZero};
 use std::path::{PathBuf};
-use std::str::FromStr;
-use std::sync::Mutex;
-use std::{sync::Arc};
+use std::str::{FromStr};
+use std::sync::{Mutex, Arc};
+
+use log::{debug, info, warn};
 
 use actix_files::NamedFile;
 use actix_web::http::header::{HeaderName, HeaderValue, TryIntoHeaderPair};
 use actix_web::http::{header, StatusCode};
-use actix_web::{Either, HttpMessage, HttpRequest, HttpResponseBuilder};
 use actix_web::{
-    web, App, HttpResponse, HttpServer
+    web, mime,
+    App, Either,
+    HttpMessage, HttpRequest, HttpResponse, HttpResponseBuilder,
+    HttpServer
 };
 
 use uuid::Uuid;
@@ -24,14 +29,15 @@ use uuid::Uuid;
 use clap::Parser;
 
 use nix_bindings_expr::{
-    eval_state::EvalState,
+    eval_state::{EvalState, ThreadRegistrationGuard},
     value::{Value, ValueType},
 };
 use nix_bindings_flake::EvalStateBuilderExt as _;
 
 use nix_bindings_store::path::StorePath;
-use nix_bindings_store::store::{Store, StoreWeak};
+use nix_bindings_store::store::{Store};
 
+/// Command-line arguments for Flack.
 #[derive(Parser, Clone, Debug)]
 #[command(version, about, long_about = None)]
 struct FlackArgs {
@@ -60,7 +66,7 @@ struct FlackArgs {
     host: String,
 
     /// The port to spawn the server on
-    #[arg(short = 'p', long, default_value_t = 2019)]
+    #[arg(short = 'p', long, default_value_t = 2020)]
     port: u16,
 
     /// The log level
@@ -72,14 +78,16 @@ struct FlackArgs {
     log_style: String
 }
 
+/// The Flack application. Contains an initial eval state,
+/// and a freshly evaluated flake.
 pub struct FlackApp {
     args: FlackArgs,
     system: String,
     state: Arc<Mutex<EvalState>>,
-    flake: Arc<Mutex<Value>>,
     app: Arc<Mutex<Value>>,
 }
 
+/// A Flack error. Gets serialized to JSON.
 #[derive(serde::Serialize, Clone, Debug)]
 struct FlackError {
     error: String,
@@ -88,6 +96,7 @@ struct FlackError {
     long: String
 }
 
+/// A Flack HTTP response. Unmarshalled from the Nix response.
 #[derive(Clone, Debug)]
 struct FlackResponse {
     code: u16,
@@ -97,31 +106,138 @@ struct FlackResponse {
     error: Option<FlackError>
 }
 
-fn get_gc_guard() -> std::io::Result<ThreadRegistrationGuard> {
-    nix_bindings_expr::eval_state::init()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+/// Implementation for Flack HTTP responses.
+impl FlackResponse {
+    /// Creates a new Flack response.
+    fn new() -> FlackResponse {
+        FlackResponse {
+            code: 0,
+            headers: Vec::new(),
+            body: None,
+            body_path: None,
+            error: None
+        }
+    }
 
-    nix_bindings_expr::eval_state::gc_register_my_thread()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    /// Converts a Flack response to an HttpResponseBuilder.
+    fn to_builder(&self) -> HttpResponseBuilder {
+        let mut builder = HttpResponseBuilder::new(StatusCode::from_u16(self.code).unwrap());
+        for (key, value) in &self.headers {
+            builder.append_header((key, value));
+        }
+        builder
+    }
+
+    /// Adds all the headers into a HttpResponse.
+    fn headers_into_response<'a>(&'a self, res: &'a mut HttpResponse) -> &'a mut HttpResponse {
+        for (key, value) in &self.headers {
+            res.headers_mut().append(key.clone(), value.clone());
+        }
+        res
+    }
+
+    /// Adds a header.
+    fn add_header(&mut self, key: String, value: String) -> &mut Self {
+        if let Ok(header_key) = HeaderName::from_str(key.as_str())
+            && let Ok(header_value) = HeaderValue::from_str(value.as_str()) {
+            self.headers.push((header_key, header_value));
+        }
+        self
+    }
+
+    /// Sets a generic 500 Internal Server Error.
+    fn server_error<S: std::fmt::Display>(&mut self, err: S) -> Self {
+        self.set(500, Either::Left(FlackError{ error: "Internal server error".to_string(), long: err.to_string() }))
+    }
+
+    /// Sets a generic 400 Bad Request.
+    fn bad_request<S: std::fmt::Display>(&mut self, err: S) -> Self {
+        self.set(400, Either::Left(FlackError{ error: "Bad request".to_string(), long: err.to_string() }))
+    }
+
+    /// Sets a generic 404 Not Found.
+    fn not_found<S: std::fmt::Display>(&mut self, err: S) -> Self {
+        self.set(404, Either::Left(FlackError{ error: "Not found".to_string(), long: err.to_string() }))
+    }
+
+    /// Sets a generic 200 OK.
+    fn ok(&mut self, body: Either<FlackError, Either<String, PathBuf>>) -> Self {
+        self.set(200, body)
+    }
+
+    /// Sets a generic string as the response with a code.
+    fn string<S: std::fmt::Display>(&mut self, code: u16, body: S) -> Self {
+        self.set(code, Either::Right(Either::Left(body.to_string())))
+    }
+
+    /// Sets a path as the response with a 200 OK.
+    fn ok_path(&mut self, body: PathBuf) -> Self {
+        self.ok(Either::Right(Either::Right(body)))
+    }
+
+    /// Sets a code and a body. If the code is greater than 0, replaces the code.
+    /// Otherwise, keeps the current code.
+    fn set(&mut self, code: u16, body: Either<FlackError, Either<String, PathBuf>>) -> Self {
+        self.code = if code > 0 {
+            code
+        } else {
+            self.code
+        };
+        match body {
+            Either::Left(left) => {
+                self.error = Some(left.to_owned());
+            },
+            Either::Right(right) => {
+                match right {
+                    Either::Left(left) => {
+                        self.body = Some(left.to_owned());
+                    },
+                    Either::Right(right) => {
+                        self.body_path = Some(right.to_owned());
+                    }
+                }
+            }
+        };
+        self.clone()
+    }
 }
 
-fn get_state(
+/// Gets the GC guard for the current thread.
+fn get_gc_guard() -> std::io::Result<ThreadRegistrationGuard> {
+    nix_bindings_expr::eval_state::gc_register_my_thread()
+        .map_err(std::io::Error::other)
+}
+
+/// Initializes the evaluator.
+fn init_get_gc_guard() -> std::io::Result<ThreadRegistrationGuard> {
+    nix_bindings_expr::eval_state::init()
+        .map_err(std::io::Error::other)?;
+
+    get_gc_guard()
+}
+
+/// Gets a new EvalState for the specified store.
+fn init_get_state(
     store: Store
 ) -> std::io::Result<(EvalState, ThreadRegistrationGuard)> {
-    let gc_guard = get_gc_guard()?;
+    let gc_guard = init_get_gc_guard()?;
 
     let flake_settings = nix_bindings_flake::FlakeSettings::new()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     let state = nix_bindings_expr::eval_state::EvalStateBuilder::new(store)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .map_err(std::io::Error::other)?
         .flakes(&flake_settings)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .map_err(std::io::Error::other)?
         .build()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     Ok((state, gc_guard))
 }
 
+/// Gets a flake.
+/// Adapted from nixops4:
+/// https://github.com/nixops4/nixops4/blob/4a42db0427b0d226bba258ab5de3b403f9ecb028/rust/nixops4-eval/src/eval.rs#L55
+/// (Licensed under LGPL v2.1)
 fn get_flake(
     eval_state: &mut EvalState,
     fetch_settings: nix_bindings_fetchers::FetchersSettings,
@@ -130,7 +246,7 @@ fn get_flake(
     input_overrides: &Vec<(String, String)>,
 ) -> std::io::Result<Value> {
     let flake_settings = nix_bindings_flake::FlakeSettings::new()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     let mut parse_flags = nix_bindings_flake::FlakeReferenceParseFlags::new(&flake_settings)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -203,92 +319,7 @@ fn get_flake(
     std::io::Result::Ok(outputs)
 }
 
-impl FlackResponse {
-    fn new() -> FlackResponse {
-        FlackResponse {
-            code: 0,
-            headers: Vec::new(),
-            body: None,
-            body_path: None,
-            error: None
-        }
-    }
-
-    fn to_builder(&self) -> HttpResponseBuilder {
-        let mut builder = HttpResponseBuilder::new(StatusCode::from_u16(self.code).unwrap());
-        for (key, value) in &self.headers {
-            builder.append_header((key, value));
-        }
-        builder
-    }
-
-    fn headers_into_response<'a>(&'a self, res: &'a mut HttpResponse) -> &'a mut HttpResponse {
-        for (key, value) in &self.headers {
-            res.headers_mut().append(key.clone(), value.clone());
-        }
-        res
-    }
-
-    fn add_header(&mut self, key: String, value: String) -> &mut Self {
-        match HeaderName::from_str(key.as_str()) {
-            Ok(header_key) => {
-                match HeaderValue::from_str(value.as_str()) {
-                    Ok(header_value) => {
-                        self.headers.push((header_key, header_value))
-                    },
-                    Err(_) => ()
-                }
-            },
-            Err(_) => ()
-        }
-        self
-    }
-
-    fn server_error<S: std::fmt::Display>(&mut self, err: S) -> Self {
-        self.set(500, Either::Left(FlackError{ error: "Internal server error".to_string(), long: err.to_string() }))
-    }
-
-    fn bad_request<S: std::fmt::Display>(&mut self, err: S) -> Self {
-        self.set(400, Either::Left(FlackError{ error: "Bad request".to_string(), long: err.to_string() }))
-    }
-
-    fn not_found<S: std::fmt::Display>(&mut self, err: S) -> Self {
-        self.set(404, Either::Left(FlackError{ error: "Not found".to_string(), long: err.to_string() }))
-    }
-
-    fn ok(&mut self, body: Either<FlackError, Either<String, PathBuf>>) -> Self {
-        self.set(200, body)
-    }
-
-    fn ok_string<S: std::fmt::Display>(&mut self, body: S) -> Self {
-        self.ok(Either::Right(Either::Left(body.to_string())))
-    }
-
-    fn ok_path(&mut self, body: PathBuf) -> Self {
-        self.ok(Either::Right(Either::Right(body)))
-    }
-
-    fn set(&mut self, code: u16, body: Either<FlackError, Either<String, PathBuf>>) -> Self {
-        self.code = code;
-        match body {
-            Either::Left(left) => {
-                self.error = Some(left.to_owned());
-            },
-            Either::Right(right) => {
-                match right {
-                    Either::Left(left) => {
-                        self.body = Some(left.to_owned());
-                    },
-                    Either::Right(right) => {
-                        self.body_path = Some(right.to_owned());
-                    }
-                }
-            }
-        };
-        self.clone()
-    }
-}
-
+/// Adds a string value to a list of name-value pairs.
 fn add_str_value(
     response: &mut FlackResponse,
     st: &mut EvalState,
@@ -302,6 +333,7 @@ fn add_str_value(
     Ok(())
 }
 
+/// Adds an int value to a list of name-value pairs.
 fn add_int_value(
     response: &mut FlackResponse,
     st: &mut EvalState,
@@ -315,6 +347,10 @@ fn add_int_value(
     Ok(())
 }
 
+/// Gets a safe store path from a given path.
+/// If the input is not a store path or points out of the store, returns an error.
+/// Otherwise, returns a tuple of (base derivation outpath, full derivation outpath, parsed path).
+/// The full derivation path may be a subpath of the toplevel derivation path.
 fn get_safe_path(
     response: &mut FlackResponse,
     store: &mut Store,
@@ -349,19 +385,23 @@ fn get_safe_path(
                 Err(err) => Err(response.server_error(err))
             }
         } else {
-            Err(response.server_error("not a store path"))
+            // Preserve the code.
+            Err(response.string(0, "not a store path"))
         }
     } else {
-        // May not be a store path.
-        Err(response.server_error("not a path"))
+        // May not be a store path. Also preserve the code.
+        Err(response.string(0, "not a path"))
     }
 }
 
+/// Returns a FlackResponse with either a path or text, depending on whether
+/// the given string starts with a store path.
 fn serve_path_or_text(
     response: &mut FlackResponse,
     st: &mut EvalState,
     dir: &String,
-    value: &Value
+    value: &Value,
+    content_type_set: bool
 ) -> Result<FlackResponse, FlackResponse> {
     debug!("Forcing value");
     let to_string = st.eval_from_string("builtins.toString", dir.as_str())
@@ -385,12 +425,25 @@ fn serve_path_or_text(
         },
         Err(_) => {
             // Serve raw text content.
-            debug!("Serving text: {}", string_value);
-            Ok(response.ok_string(string_value))
+            debug!("Serving text: {}", response.code);
+            if !content_type_set {
+                // Default to text/plain.
+                let header = header::ContentType::plaintext().try_into_pair()
+                    .map_err(|err| response.server_error(err))?;
+                let key = header.0.to_string();
+                let value = header.1.to_str().map_err(|err| response.server_error(err))?.to_string();
+                response.add_header(key, value);
+            }
+            Ok(response.string(0, string_value))
         }
     }
 }
 
+/// The core Flack handler.
+/// This starts by assembling the request context, then immediately offloading eval to
+/// an Actix worker thread so it can assemble the request environment in Nix.
+/// This worker thread handles the current request, including calling into the Nix EvalState.
+/// Once the application is called, the result is unpacked and returned back to the toplevel Actix handler.
 async fn flack_handler(req: HttpRequest, request_body: web::Bytes) -> Result<FlackResponse, FlackResponse> {
     let app = req.app_data::<web::Data<FlackApp>>().unwrap().clone();
 
@@ -479,19 +532,15 @@ async fn flack_handler(req: HttpRequest, request_body: web::Bytes) -> Result<Fla
                 }
             };
 
-            match json_body {
-                Some(body) => {
-                    let from_json = st.eval_from_string("builtins.fromJSON", dir.as_str())
-                        .map_err(|err| response.server_error(err))?;
-                    let body_val = st.new_value_str(body)
-                        .map_err(|err| response.bad_request(err))?;
-                    debug!("fromJSON on body");
-                    let body_attrset_val = st.call(from_json, body_val)
-                        .map_err(|err| response.bad_request(err))?;
-                    pairs.push(("flack.body".to_string(), body_attrset_val));
-                    ()
-                },
-                None => ()
+            if let Some(body) = json_body {
+                let from_json = st.eval_from_string("builtins.fromJSON", dir.as_str())
+                    .map_err(|err| response.server_error(err))?;
+                let body_val = st.new_value_str(body)
+                    .map_err(|err| response.bad_request(err))?;
+                debug!("fromJSON on body");
+                let body_attrset_val = st.call(from_json, body_val)
+                    .map_err(|err| response.bad_request(err))?;
+                pairs.push(("flack.body".to_string(), body_attrset_val));
             }
         }
 
@@ -530,7 +579,9 @@ async fn flack_handler(req: HttpRequest, request_body: web::Bytes) -> Result<Fla
         };
         let code = st.require_int(&code_val)
             .map_err(|err| response.server_error(err))?;
-        if !(100..=599).contains(&code) {
+        if (100..=599).contains(&code) {
+            response.code = code as u16;
+        } else {
             return Err(response.server_error("invalid status code"));
         }
 
@@ -555,24 +606,17 @@ async fn flack_handler(req: HttpRequest, request_body: web::Bytes) -> Result<Fla
 
         let mut content_type_set: bool = false;
         for header_name in res_headers_names.iter() {
-            match st.require_attrs_select(&res_headers_value, header_name) {
-                Ok(val) => {
-                    match st.require_string(&val) {
-                        Ok(header_value) => {
-                            if header_name.eq_ignore_ascii_case("content-type") {
-                                content_type_set = true;
-                            }
-                            response.add_header(header_name.to_string(), header_value.to_string());
-                        },
-                        Err(_) => ()
-                    }
-                },
-                Err(_) => ()
-            };
+            if let Ok(val) = st.require_attrs_select(&res_headers_value, header_name)
+                && let Ok(header_value) = st.require_string(&val) {
+                if header_name.eq_ignore_ascii_case("content-type") {
+                    content_type_set = true;
+                }
+                response.add_header(header_name.to_string(), header_value.to_string());
+            }
         }
 
         if body_type == ValueType::String {
-            serve_path_or_text(&mut response, &mut st, &dir, &body)
+            serve_path_or_text(&mut response, &mut st, &dir, &body, content_type_set)
         } else if body_type == ValueType::AttrSet {
             // Could be a derivation.
             let attrs_type = match st.require_attrs_select_opt(&body, "type") {
@@ -586,7 +630,7 @@ async fn flack_handler(req: HttpRequest, request_body: web::Bytes) -> Result<Fla
                 Err(_) => "attrs".to_string(),
             };
             if attrs_type.as_str().eq("derivation") {
-                serve_path_or_text(&mut response, &mut st, &dir, &body)
+                serve_path_or_text(&mut response, &mut st, &dir, &body, content_type_set)
             } else {
                 // Normal attrset, try to coerce to JSON
                 let to_json = st.eval_from_string("builtins.toJSON", dir.as_str())
@@ -600,14 +644,14 @@ async fn flack_handler(req: HttpRequest, request_body: web::Bytes) -> Result<Fla
                 debug!("Serving attrset as JSON: {}", json_str);
 
                 if !content_type_set {
-                    // Force it to JSON if there was not a content type overridden by the app.
+                    // Default to application/json.
                     let header = header::ContentType::json().try_into_pair()
                         .map_err(|err| response.server_error(err))?;
                     let key = header.0.to_string();
                     let value = header.1.to_str().map_err(|err| response.server_error(err))?.to_string();
                     response.add_header(key, value);
                 }
-                Ok(response.ok_string(json_str))
+                Ok(response.string(response.code, json_str))
             }
         } else {
             Err(response.server_error("body was not a string or attribute set"))
@@ -617,9 +661,12 @@ async fn flack_handler(req: HttpRequest, request_body: web::Bytes) -> Result<Fla
     .map_err(|err| FlackResponse::new().server_error(err))?
 }
 
+/// This function builds an HttpResponse from a FlackResponse.
+/// It handles literal bodies, body paths, and errors that get serialized as JSON.
 async fn build_response(req: HttpRequest, response: &FlackResponse) -> HttpResponse {
     if response.body.is_some() {
         let mut builder = response.to_builder();
+        builder.status(StatusCode::from_u16(response.code).unwrap());
         builder.body(response.body.as_ref().unwrap().clone())
     } else if response.body_path.is_some() {
         match NamedFile::open_async(response.body_path.as_ref().unwrap().clone()).await {
@@ -656,6 +703,7 @@ async fn build_response(req: HttpRequest, response: &FlackResponse) -> HttpRespo
     }
 }
 
+/// This is the toplevel Flack request handler.
 async fn flack(req: HttpRequest, body: web::Bytes) -> actix_web::Result<HttpResponse> {
     match flack_handler(req.clone(), body).await
     {
@@ -664,6 +712,29 @@ async fn flack(req: HttpRequest, body: web::Bytes) -> actix_web::Result<HttpResp
     }
 }
 
+/// The main application entrypoint. In order, we:
+/// - Parse command line arguments
+/// - Connect to the store
+/// - Load the application flake
+/// - Eval the app attribute
+///
+/// After we have something that we think is a Flack application,
+/// we enter the Actix event loop, and start serving it.
+///
+/// Note that there is a logistical challenge with EvalState being shared between
+/// threads, since we need to share an EvalState that's created in main with
+/// the Actix thread pool.
+///
+/// The side effects if we create a _new_ EvalState are assert failures in Nix.
+/// Even though the heap is shared, the symbol table and other things are not.
+///
+/// So we have to "clone" the EvalState (which, under the hood, uses an Arc)
+/// and call into it from multiple threads. Rust has no way of knowing whether the
+/// underlying C implementation is safe, and the consequence if it's not is rapid heap
+/// corruption.
+///
+/// Right now, it seems that EvalState is only safe to use in multiple threads
+/// in the parallel eval branch.
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let mut args = FlackArgs::parse();
@@ -694,19 +765,19 @@ async fn main() -> std::io::Result<()> {
         &[("max-connections", format!("{}", args.max_connections).as_str())])
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-    info!("Connecting to store: {}", store_uri.to_string());
+    info!("Connecting to store: {}", store_uri);
 
     let store = nix_bindings_store::store::Store::open(Some(store_uri.to_string().as_str()), [])
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))?;
 
     info!("Loading flake: {}", args.flake);
 
-    let (mut st, _guard) = get_state(store)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let (mut st, _guard) = init_get_state(store)
+        .map_err(std::io::Error::other)?;
 
     // Get the flake.
     let fetch_settings = nix_bindings_fetchers::FetchersSettings::new()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     let flake = get_flake(&mut st, fetch_settings, &args.dir, &args.flake, &std::vec::Vec::new())?;
 
     info!(
@@ -737,20 +808,17 @@ async fn main() -> std::io::Result<()> {
 
     let args_mutex = Arc::new(Mutex::<FlackArgs>::new(args));
     let state_mutex = Arc::new(Mutex::<EvalState>::new(st.clone()));
-    let flake_mutex = Arc::new(Mutex::<Value>::new(flake));
     let app_mutex = Arc::new(Mutex::<Value>::new(app));
 
     let server = HttpServer::new(move || {
         let args_data = args_mutex.get_cloned().expect("no args");
         let state_data = state_mutex.get_cloned().expect("no state");
-        let flake_data = flake_mutex.get_cloned().expect("no flake");
         let app_data = app_mutex.get_cloned().expect("no app");
 
         let app = FlackApp {
             args: args_data,
             system: nix_bindings_util::settings::get("system").unwrap_or("unknown".to_string()),
             state: Arc::new(Mutex::<EvalState>::new(state_data)),
-            flake: Arc::new(Mutex::<Value>::new(flake_data)),
             app: Arc::new(Mutex::<Value>::new(app_data))
         };
 
@@ -769,6 +837,8 @@ async fn main() -> std::io::Result<()> {
 /_/   /_____/_/  |_\____/_/ |_|
 Bound to {}:{}
 "#, log_host, port);
+
+    info!("Flack is onstage at {}:{}...", log_host, port);
 
     server.run().await
 }

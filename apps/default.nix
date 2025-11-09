@@ -8,7 +8,7 @@
 # This application demos mounts, middlewares, and routes.
 #
 # Note that we expose it with:
-# flack.apps.default = flack.lib.mkApp {
+# flack.apps.default = flack.mkApp {
 #   imports = [ ./apps ];
 #   specialArgs = { inherit self; };
 # }
@@ -107,7 +107,7 @@
       This route reflects the JSON payload (req.body) at the user.
       Note the auth token above!
       `curl -X POST -H 'X-Auth-Token: supersecret' -H 'Content-Type: application/json' \
-       -d '{"baz": "quux"}" http://localhost:2019/foo/myBar`
+       -d '{"baz": "quux"}' http://localhost:2019/foo/myBar`
     */
     POST."/foo/:bar" =
       req:
@@ -117,6 +117,6 @@
       };
 
     # This is another route. We can omit headers if we just want a JSON body.
-    GET."/baz" = req: req.res 200 { "baz" = "quux"; };
+    GET."/baz" = req: req.res 200 "Hello, flack!";
   };
 }
