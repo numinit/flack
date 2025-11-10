@@ -59,7 +59,7 @@ Check out the example app in [apps/default.nix](https://github.com/numinit/flack
 It contains a partial search.nixos.org implementation, as well as examples of sandboxed CGI scripts, mounts,
 middlewares, and normal routes.
 
-Run it by either:
+- Run it by either:
     - `nix run github:numinit/flack -- --flake github:numinit/flack`
     - Cloning, and `nix run`
 
