@@ -5,8 +5,21 @@ Write web applications using your [favorite reproducible configuration language]
 Flack serves an HTTP server from Nix projects using a [Rack](https://rack.github.io/rack/main/SPEC_rdoc.html)-inspired CGI gateway,
 and provides a web router API written in Nix that works like [Express](https://expressjs.com/) and [Sinatra](https://sinatrarb.com/).
 
-Flack works with both flakes and non-flakes, using [idc](https://github.com/jakehamilton/idc) to load projects that it can't natively
+It works with both flakes and non-flakes, using [idc](https://github.com/jakehamilton/idc) to load projects that it can't natively
 load with Nix.
+
+## Start search.nixos.org on any flake!
+
+The following example will document options and packages in [nixPKCS](https://github.com/numinit/nixpkcs).
+Click the "Flakes" button and type "pkcs11" to see module options and packages.
+
+    nix run github:numinit/flack -- --flake github:numinit/flack?dir=search \
+        --override-input flake github:numinit/nixpkcs
+
+You can override the 'flake' input of the search app to any flake you want.
+
+The first request on each channel may take up to 30 seconds to load as nixpkgs is evaluated.
+Subsequent requests will be fast.
 
 ## Experimental
 
@@ -61,7 +74,7 @@ if you'd like examples of sandboxed CGI scripts, mounts, middlewares, and normal
 For a more complicated app implementing a subset of search.nixos.org features, check out the `search` directory.
 
 - Run it by either:
-    - `nix run github:numinit/flack -- --flake github:numinit/flack?dir=search`
+    - `nix run github:numinit/flack -- --flake github:numinit/flack?dir=search --override-input flake github:numinit/flack`
     - Cloning, and `nix run` inside the `search` directory
 
 Then you can browse to http://localhost:2020 and try an implementation of search.nixos.org in pure Nix.

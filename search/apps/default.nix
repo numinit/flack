@@ -6,6 +6,10 @@
 }:
 
 let
+  inherit (builtins)
+    baseNameOf
+    ;
+
   inherit (lib.trivial)
     isInt
     max
@@ -14,9 +18,11 @@ let
 
   inherit (lib.strings)
     isString
+    isPath
     removePrefix
     removeSuffix
     toLower
+    concatStrings
     hasInfix
     match
     escapeXML
@@ -26,11 +32,13 @@ let
   inherit (lib.lists)
     isList
     elemAt
+    any
     head
+    tail
     length
     concatMap
     filter
-    any
+    imap0
     sublist
     flatten
     findFirst
@@ -39,6 +47,7 @@ let
 
   inherit (lib.attrsets)
     optionalAttrs
+    filterAttrs
     attrsToList
     ;
 
@@ -151,6 +160,32 @@ in
             nixosOptionsUnder
             ;
 
+          # Possibly overrides a flake URL with the specified name.
+          # Used to take input flake URLs and replace them with the ones Flack knows about.
+          overrideFlakeUrl =
+            name: url:
+            let
+              overrideInput = req.overrideInput name;
+            in
+            if overrideInput == null then
+              if isString url then
+                url
+              else if isPath url then
+                # Can't refer to a store path in here, need something.
+                "github:~${name}/${concatStrings (tail (splitString "-" (baseNameOf url)))}"
+              else
+                toString url
+            else
+              overrideInput;
+
+          # Returns true if the given attribute name is probably nixpkgs (e.g. 'nixpkgs',
+          # 'nixpkgs[_-]XX[_.-]YY', 'nixpkgs-stable', 'nixpkgs-unstable', or the nixos versions).
+          # Also special-cases nixos-search and flack since they are two of our flake inputs.
+          maybeNixpkgs =
+            name:
+            name == "flack"
+            || match "^nix(pkgs|os)([_-]([0-9_\\.-]+)$|[_-](un)?stable$|[_-]search$|$)" name != null;
+
           # Creates extra data depending on whether we are searching a flake or not.
           mkExtra =
             name: flake:
@@ -161,23 +196,25 @@ in
               inherit flake;
             };
 
-          # All packages we are searching for.
+          # All packages we are searching for. Looks at their packages or legacyPackages.
           packageResultsFor =
             flakes:
             concatMap (
               { name, value }:
-              if value ? legacyPackages.${req.system} then
+              if value ? packages.${req.system} then
+                packagesUnder [ ] (_: _: true) (mkExtra name value) value.packages.${req.system}
+              else if value ? legacyPackages.${req.system} then
                 packagesUnder [ ] (_: _: true) (mkExtra name value) value.legacyPackages.${req.system}
               else
                 [ ]
             ) (attrsToList flakes);
 
-          # All options we are searching for.
+          # All options we are searching for. Looks at their nixosModule or nixosModules.
           optionResultsFor =
             flakes:
             concatMap (
               { name, value }:
-              if name == "nixpkgs" || match "^nixpkgs-[0-9]+" name != null then
+              if maybeNixpkgs name then
                 nixosOptionsUnder {
                   nixpkgs = value;
                   extra = mkExtra name value;
@@ -185,16 +222,19 @@ in
               else
                 flakeOptionsUnder {
                   nixpkgs = theNixpkgs;
+                  inherit name;
                   flake = value;
                   resolved = value;
                   extra = mkExtra name value;
+                  urlOverride = overrideFlakeUrl;
                 }
             ) (attrsToList flakes);
 
           # Results from the above.
           allResults =
             let
-              selectedFlakes = if isFlakeSearch then inputs' else { nixpkgs = theNixpkgs; };
+              selectedFlakes =
+                if isFlakeSearch then filterAttrs (n: v: !(maybeNixpkgs n)) inputs' else { nixpkgs = theNixpkgs; };
             in
             if isPackageSearch then
               packageResultsFor selectedFlakes
@@ -251,7 +291,19 @@ in
               flake_description = emptyToNull (flake.description or "");
               revision = flake.rev or flake.dirtyRev or null;
               flake_source =
-                if flake ? url && builtins ? parseFlakeRef then builtins.parseFlakeRef flake.url else null;
+                if flake ? url && builtins ? parseFlakeRef then
+                  let
+                    ref = builtins.parseFlakeRef (overrideFlakeUrl name flake.url);
+                  in
+                  {
+                    inherit (ref) type;
+                    owner = ref.owner or null;
+                    repo = ref.repo or null;
+                    git_ref = ref.ref or null;
+                    description = flake.description or null;
+                  }
+                else
+                  null;
               flake_resolved = flake_source;
             };
 
@@ -308,7 +360,11 @@ in
             {
               type = "option";
               option_name = name;
-              option_source = head (option.declarations or [ "unknown" ]);
+              option_source =
+                let
+                  declarations = option.declarations or [ ];
+                in
+                if declarations == null || declarations == [ ] then "unknown" else head declarations;
               # XXX: This needs Markdown rendering but we can get away with the ugly thing for now.
               option_description =
                 let
@@ -324,11 +380,15 @@ in
 
           # Creates an arbitrary Elasticsearch document.
           mkDoc =
-            { source, sort }:
+            {
+              idx,
+              source,
+              sort,
+            }:
             rec {
               _index = "flack";
               _type = "_doc";
-              _id = req.id;
+              _id = "${req.id}.${toString idx}";
               _score = 1.0;
               _source = source;
               _sort = singleton _score ++ sort;
@@ -337,6 +397,7 @@ in
 
           # Creates a "hit" for a package.
           mkPackageHit =
+            idx:
             {
               name,
               value,
@@ -352,6 +413,7 @@ in
                 if version' == null then "" else version';
             in
             mkDoc {
+              inherit idx;
               source = mkPackageSource (
                 {
                   inherit name packageName version;
@@ -369,6 +431,7 @@ in
 
           # Creates a hit for an option.
           mkOptionHit =
+            idx:
             {
               name,
               value,
@@ -376,6 +439,7 @@ in
               ...
             }:
             mkDoc {
+              inherit idx;
               source = mkOptionSource (
                 {
                   inherit name;
@@ -429,7 +493,7 @@ in
             max_score = null;
 
             # Paginate the matched packages.
-            hits = sublist from size (map mkHit matches);
+            hits = sublist from size (imap0 mkHit matches);
           };
 
           # TODO: implement aggregations.

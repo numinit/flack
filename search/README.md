@@ -2,7 +2,7 @@
 
 An implementation of the search.nixos.org Elasticsearch API in pure Nix.
 
-`nix run github:numinit/flack -- --flake github:numinit/flack?dir=search`
+`nix run github:numinit/flack -- --flake github:numinit/flack?dir=search --override-input flake github:chaotic-cx/nyx`
 
 ## Notes
 

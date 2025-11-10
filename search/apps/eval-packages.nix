@@ -80,7 +80,7 @@ let
             # this is done to import *profiles* which do not declare any options, so we
             # can allow it.
             inherit pkgs;
-            modulesPath = "${nixpkgs.path}/nixos/modules";
+            modulesPath = "${nixpkgs}/nixos/modules";
           };
         }).options;
 
@@ -148,9 +148,11 @@ let
   flakeOptionsUnder =
     {
       nixpkgs,
+      name,
       flake,
       resolved,
       extra ? { },
+      urlOverride ? name: url: url,
     }:
     let
       nixosModulesOpts = lib.concatLists (
@@ -160,7 +162,7 @@ let
             inherit nixpkgs extra module;
             modulePath =
               lib.optionals (flake ? url) [
-                flake.url
+                (urlOverride name flake.url)
               ]
               ++ [
                 moduleName
@@ -172,7 +174,7 @@ let
       nixosModuleOpts = lib.optionals (resolved ? nixosModule) (readNixOSOptions {
         inherit nixpkgs extra;
         module = resolved.nixosModule;
-        modulePath = lib.optional (flake ? url) flake.url;
+        modulePath = lib.optional (flake ? url) (urlOverride name flake.url);
       });
     in
     # We assume that `nixosModules` includes `nixosModule` when there

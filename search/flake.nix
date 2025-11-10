@@ -5,6 +5,9 @@
     nixpkgs-lib.url = "github:numinit/nixpkgs.lib";
     nixos-search.url = "github:NixOS/nixos-search";
     flack.url = ./..;
+
+    # This one gets overridden to the search target.
+    flake.url = "github:numinit/flack?dir=search";
   };
 
   outputs =
@@ -30,7 +33,12 @@
           };
 
           # "Inputs prime" is inputs updated with the URLs and self.
-          inputs' = lib.recursiveUpdate (import ./flake.nix).inputs (inputs // { self = self'; });
+          inputs' = lib.recursiveUpdate (import ./flake.nix).inputs (
+            inputs
+            // {
+              self = self';
+            }
+          );
         };
       };
 

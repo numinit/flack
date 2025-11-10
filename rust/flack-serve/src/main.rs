@@ -555,6 +555,7 @@ async fn flack_handler(
     ];
     let int_inputs = [("SERVER_PORT", port as i64)];
 
+    let overrides = app.args.override_input.clone();
     let headers = req.headers().clone();
     let mime_type = req.mime_type();
     let request_body_mutex = Arc::new(Mutex::<web::Bytes>::new(request_body));
@@ -572,12 +573,23 @@ async fn flack_handler(
             .get_cloned()
             .map_err(|err| response.server_error(err))?;
 
-        let mut pairs = Vec::with_capacity(str_inputs.len() + int_inputs.len() + 1);
+        let mut pairs =
+            Vec::with_capacity(str_inputs.len() + int_inputs.len() + overrides.len() + 1);
         for (key, value) in str_inputs {
             add_str_value(&mut response, &mut st, &mut pairs, key, value.as_str())?;
         }
         for (key, value) in int_inputs {
             add_int_value(&mut response, &mut st, &mut pairs, key, value)?;
+        }
+        for name_value in overrides.chunks(2) {
+            let key = format!("flack.override.{}", name_value[0]);
+            add_str_value(
+                &mut response,
+                &mut st,
+                &mut pairs,
+                key.as_str(),
+                name_value[1].as_str(),
+            )?;
         }
 
         match headers.get("host") {

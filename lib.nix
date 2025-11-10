@@ -258,6 +258,7 @@ rec {
           # Flack attributes.
           id = env."flack.request_id";
           system = env."flack.system";
+          overrideInput = input: env."flack.override.${input}" or null;
         };
       in
       req;
