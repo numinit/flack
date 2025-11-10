@@ -3,15 +3,12 @@
   inputs = {
     nix.url = "github:DeterminateSystems/nix-src";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nixpkgs-stable.url = "github:NixOS/nixpkgs/nixos-25.05";
     nixpkgs-lib.url = "github:numinit/nixpkgs.lib";
     flake-parts.url = "github:hercules-ci/flake-parts";
     flake-compat.url = "https://flakehub.com/f/edolstra/flake-compat/1.tar.gz";
     flakever.url = "github:numinit/flakever";
     nix-cargo-integration.url = "github:90-008/nix-cargo-integration";
     nix-bindings-rust.url = "github:numinit/nix-bindings-rust";
-
-    nixos-search.url = "github:NixOS/nixos-search";
   };
 
   outputs =
@@ -21,7 +18,6 @@
       nixpkgs-lib,
       flake-parts,
       flakever,
-      nixos-search,
       ...
     }:
     let
@@ -53,24 +49,16 @@
           in
           flack
           // {
-            apps.simple = flack.mkApp {
-              route = {
-                GET."/" = req: req.res 200 "Hello, Flack!";
+            apps.default = flack.mkApp {
+              modules = [ ./apps ];
+              specialArgs = {
+                inherit inputs;
               };
             };
 
-            apps.default = flack.mkApp {
-              modules = [ ./apps ];
-              specialArgs = rec {
-                inherit self inputs;
-
-                # We don't have access to self in inputs, so add it here.
-                self' = self // {
-                  url = "file:.";
-                };
-
-                # "Inputs prime" is inputs updated with the URLs and self.
-                inputs' = lib.recursiveUpdate (import ./flake.nix).inputs (inputs // { self = self'; });
+            apps.simple = flack.mkApp {
+              route = {
+                GET."/" = req: req.res 200 "Hello, Flack!\n";
               };
             };
           };
@@ -118,7 +106,6 @@
 
           overlayAttrs = {
             flack = outputs."flack".packages.release;
-            nixos-search-frontend = nixos-search.packages.${system}.frontend;
           };
 
           packages = rec {

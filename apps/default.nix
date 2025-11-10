@@ -17,15 +17,6 @@
 # By default, flack serves flack.apps.default, though this can be changed
 # on the command line of flack-serve.
 {
-  /*
-    You can import other pieces of the application via the module system:
-    this one implements pieces of search.nixos.org.
-
-    Note that it takes a while to start up after the first search on each channel
-    but subsequent searches should be fast.
-  */
-  imports = [ ./search.nix ];
-
   mount = {
     /*
       This is a mountpoint.
@@ -116,6 +107,6 @@
       };
 
     # This is another route. We can omit headers if we just want a JSON body.
-    GET."/baz" = req: req.res 200 "Hello, flack!";
+    GET."" = req: req.res 200 "Hello, Flack!\n";
   };
 }
