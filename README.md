@@ -55,12 +55,13 @@ at the directory or file to load. This also works fine with flakes.
 
 ## Examples
 
-Check out the example app in [apps/default.nix](https://github.com/numinit/flack/blob/master/apps/default.nix).
-It contains a partial search.nixos.org implementation, as well as examples of sandboxed CGI scripts, mounts,
-middlewares, and normal routes.
+Check out the example app in [apps/default.nix](https://github.com/numinit/flack/blob/master/apps/default.nix),
+if you'd like examples of sandboxed CGI scripts, mounts, middlewares, and normal routes.
+
+For a more complicated app implementing a subset of search.nixos.org features, check out the `search` directory.
 
 - Run it by either:
-    - `nix run github:numinit/flack -- --flake github:numinit/flack`
-    - Cloning, and `nix run`
+    - `nix run github:numinit/flack -- --flake github:numinit/flack?dir=search`
+    - Cloning, and `nix run` inside the `search` directory
 
-Then you can browse to http://localhost:2020 and try an implementation of search.nixos.org in pure Nix
+Then you can browse to http://localhost:2020 and try an implementation of search.nixos.org in pure Nix.
