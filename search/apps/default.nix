@@ -43,20 +43,22 @@ let
     ;
 
   inherit (flack.lib.paths) joinPathToIndex;
-
-  getFrontend =
-    req: path: "${inputs'.nixos-search.packages.${req.system}.frontend}/${joinPathToIndex path}";
 in
 {
-  route = rec {
-    # These allow us to serve a static site with Flack.
-    # In all cases, the nixos-search frontend is built on-demand and a path under it is served.
-    GET."/" = req: req.res 200 { } (getFrontend req [ "/" ]);
-    GET."/packages" = GET."/";
-    GET."/options" = GET."/";
-    GET."/flakes" = GET."/";
-    GET."/:...path" = req: req.res 200 { } (getFrontend req req.params.path);
-  };
+  route =
+    let
+      getFrontend =
+        req: path: "${inputs'.nixos-search.packages.${req.system}.frontend}/${joinPathToIndex path}";
+    in
+    rec {
+      # These allow us to serve a static site with Flack.
+      # In all cases, the nixos-search frontend is built on-demand and a path under it is served.
+      GET."/" = req: req.res 200 { } (getFrontend req [ "/" ]);
+      GET."/packages" = GET."/";
+      GET."/options" = GET."/";
+      GET."/flakes" = GET."/";
+      GET."/:...path" = req: req.res 200 { } (getFrontend req req.params.path);
+    };
 
   mount = {
     "/backend" = {

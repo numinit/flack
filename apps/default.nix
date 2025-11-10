@@ -107,6 +107,6 @@
       };
 
     # This is another route. We can omit headers if we just want a JSON body.
-    GET."" = req: req.res 200 "Hello, Flack!\n";
+    GET."/" = req: req.res 200 "Hello, Flack!\n";
   };
 }
