@@ -11,15 +11,15 @@ load with Nix.
 ## Start search.nixos.org on any flake!
 
 The following example will document options and packages in [nixPKCS](https://github.com/numinit/nixpkcs).
-Click the "Flakes" button and type "pkcs11" to see module options and packages.
+Visit http://localhost:2020, click the "Flakes" button, and type "pkcs11" to see module options and packages.
 
     nix run github:numinit/flack -- --flake github:numinit/flack?dir=search \
         --override-input flake github:numinit/nixpkcs
 
 You can override the 'flake' input of the search app to any flake you want.
 
-The first request on each channel may take up to 30 seconds to load as nixpkgs is evaluated.
-Subsequent requests will be fast.
+The first request on each channel may take up to 30 seconds to load as nixpkgs is evaluated
+(and nixos-search is compiled in the background). Subsequent requests will be fast.
 
 ## Experimental
 
