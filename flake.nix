@@ -3,7 +3,7 @@
   inputs = {
     nix.url = "github:DeterminateSystems/nix-src";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nixpkgs-25_05.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs-stable.url = "github:NixOS/nixpkgs/nixos-25.05";
     nixpkgs-lib.url = "github:numinit/nixpkgs.lib";
     flake-parts.url = "github:hercules-ci/flake-parts";
     flake-compat.url = "https://flakehub.com/f/edolstra/flake-compat/1.tar.gz";
@@ -44,7 +44,7 @@
       ];
 
       flake = {
-        versionTemplate = "0.1-<lastModifiedDate>-<rev>";
+        versionTemplate = "0.2-<lastModifiedDate>-<rev>";
         inherit (flakeverConfig) version versionCode;
 
         flack =
@@ -61,8 +61,16 @@
 
             apps.default = flack.mkApp {
               modules = [ ./apps ];
-              specialArgs = {
-                inherit self;
+              specialArgs = rec {
+                inherit self inputs;
+
+                # We don't have access to self in inputs, so add it here.
+                self' = self // {
+                  url = "file:.";
+                };
+
+                # "Inputs prime" is inputs updated with the URLs and self.
+                inputs' = lib.recursiveUpdate (import ./flake.nix).inputs (inputs // { self = self'; });
               };
             };
           };
@@ -85,7 +93,7 @@
         let
           outputs = config.nci.outputs;
         in
-        {
+        rec {
           _module.args.pkgs = import inputs.nixpkgs {
             inherit system;
             overlays = [
@@ -113,10 +121,12 @@
             nixos-search-frontend = nixos-search.packages.${system}.frontend;
           };
 
-          packages = {
-            default = pkgs.flack;
-            inherit (pkgs) flack;
+          packages = rec {
+            flack = outputs."flack".packages.release;
+            default = flack;
           };
+
+          legacyPackages.flack = packages.flack;
 
           apps.default = {
             program = "${pkgs.flack}/bin/flack-serve";

@@ -10,9 +10,10 @@
 use std::num::{NonZero};
 use std::path::{PathBuf};
 use std::str::{FromStr};
-use std::sync::{Mutex, Arc};
+use std::sync::{Arc, Mutex, Once};
+use std::time::{Duration, Instant};
 
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 
 use actix_files::NamedFile;
 use actix_web::http::header::{HeaderName, HeaderValue, TryIntoHeaderPair};
@@ -24,6 +25,7 @@ use actix_web::{
     HttpServer
 };
 
+use nix_bindings_expr::eval_state::gc_now;
 use uuid::Uuid;
 
 use clap::Parser;
@@ -41,13 +43,23 @@ use nix_bindings_store::store::{Store};
 #[derive(Parser, Clone, Debug)]
 #[command(version, about, long_about = None)]
 struct FlackArgs {
-    /// The directory to use; defaults to the current working directory
+    /// The working directory to use for eval.
+    /// Defaults to the current working directory.
+    /// If --import is used, this is ignored and set to the closest parent directory.
     #[arg(short = 'd', long, default_value = ".")]
     dir: String,
+
+    /// The path to import using idc. Overrides --flake.
+    #[arg(short = 'i', long)]
+    import: Option<String>,
 
     /// The flake reference to use; defaults to "."
     #[arg(short = 'f', long, default_value = ".")]
     flake: String,
+
+    /// Overrides to the given flake's inputs.
+    #[arg(short = 'o', long, num_args = 2)]
+    override_input: Vec<String>,
 
     /// The flake attribute containing the Flack app
     #[arg(short = 'a', long, default_value = "flack.apps.default")]
@@ -66,7 +78,7 @@ struct FlackArgs {
     host: String,
 
     /// The port to spawn the server on
-    #[arg(short = 'p', long, default_value_t = 2020)]
+    #[arg(short = 'P', long, default_value_t = 2020)]
     port: u16,
 
     /// The log level
@@ -75,7 +87,11 @@ struct FlackArgs {
 
     /// The log style
     #[arg(short = 'L', long, default_value = "always")]
-    log_style: String
+    log_style: String,
+
+    /// GC after evals lasting this long (milliseconds)
+    #[arg(short = 'G', long, default_value_t = 15000)]
+    gc_after: u32,
 }
 
 /// The Flack application. Contains an initial eval state,
@@ -100,6 +116,7 @@ struct FlackError {
 #[derive(Clone, Debug)]
 struct FlackResponse {
     code: u16,
+    start: Instant,
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Option<String>,
     body_path: Option<PathBuf>,
@@ -112,6 +129,7 @@ impl FlackResponse {
     fn new() -> FlackResponse {
         FlackResponse {
             code: 0,
+            start: Instant::now(),
             headers: Vec::new(),
             body: None,
             body_path: None,
@@ -175,6 +193,13 @@ impl FlackResponse {
         self.ok(Either::Right(Either::Right(body)))
     }
 
+    /// Returns the current duration of this request, resetting the timer.
+    fn stopwatch(&mut self) -> Duration {
+        let start = self.start;
+        self.start = Instant::now();
+        self.start.saturating_duration_since(start)
+    }
+
     /// Sets a code and a body. If the code is greater than 0, replaces the code.
     /// Otherwise, keeps the current code.
     fn set(&mut self, code: u16, body: Either<FlackError, Either<String, PathBuf>>) -> Self {
@@ -218,17 +243,22 @@ fn init_get_gc_guard() -> std::io::Result<ThreadRegistrationGuard> {
 
 /// Gets a new EvalState for the specified store.
 fn init_get_state(
-    store: Store
+    store: Store,
+    flakes: bool
 ) -> std::io::Result<(EvalState, ThreadRegistrationGuard)> {
     let gc_guard = init_get_gc_guard()?;
 
-    let flake_settings = nix_bindings_flake::FlakeSettings::new()
+    let mut state_builder = nix_bindings_expr::eval_state::EvalStateBuilder::new(store)
         .map_err(std::io::Error::other)?;
-    let state = nix_bindings_expr::eval_state::EvalStateBuilder::new(store)
-        .map_err(std::io::Error::other)?
-        .flakes(&flake_settings)
-        .map_err(std::io::Error::other)?
-        .build()
+
+    if flakes {
+        let flake_settings = nix_bindings_flake::FlakeSettings::new()
+            .map_err(std::io::Error::other)?;
+        state_builder = state_builder.flakes(&flake_settings)
+            .map_err(std::io::Error::other)?;
+    }
+
+    let state = state_builder.build()
         .map_err(std::io::Error::other)?;
 
     Ok((state, gc_guard))
@@ -241,7 +271,7 @@ fn init_get_state(
 fn get_flake(
     eval_state: &mut EvalState,
     fetch_settings: nix_bindings_fetchers::FetchersSettings,
-    basedir_str: &String,
+    basedir_str: &str,
     flakeref_str: &String,
     input_overrides: &Vec<(String, String)>,
 ) -> std::io::Result<Value> {
@@ -251,7 +281,7 @@ fn get_flake(
     let mut parse_flags = nix_bindings_flake::FlakeReferenceParseFlags::new(&flake_settings)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-    parse_flags.set_base_directory(basedir_str.as_str())
+    parse_flags.set_base_directory(basedir_str)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
     let parse_flags = parse_flags;
@@ -352,46 +382,72 @@ fn add_int_value(
 /// Otherwise, returns a tuple of (base derivation outpath, full derivation outpath, parsed path).
 /// The full derivation path may be a subpath of the toplevel derivation path.
 fn get_safe_path(
-    response: &mut FlackResponse,
     store: &mut Store,
     unsafe_path_str: &str
-) -> Result<(PathBuf, PathBuf, StorePath), FlackResponse> {
+) -> std::io::Result<(PathBuf, PathBuf, StorePath)> {
     let store_root_str = format!(
         "{}/",
         store.get_storedir()
-            .map_err(|err| response.server_error(err))?
+            .map_err(std::io::Error::other)?
     );
     if unsafe_path_str.starts_with(store_root_str.as_str()) {
         // It looks like a store path... is it really one?
         let store_root = PathBuf::from_str(store_root_str.as_str())
-            .map_err(|err| response.server_error(err))?;
+            .map_err(std::io::Error::other)?;
 
         if !store_root.is_absolute() {
             // Sanity check it.
-            return Err(response.server_error("store root was not absolute, bailing out"));
+            return Err(std::io::Error::other("store root was not absolute, bailing out"));
         }
 
         let num_components = store_root.components().count() + 1;
         let unsafe_path = PathBuf::from_str(unsafe_path_str)
-            .map_err(|err| response.server_error(err))?
+            .map_err(std::io::Error::other)?
             .normalize_lexically()
-            .map_err(|err| response.server_error(err))?;
+            .map_err(std::io::Error::other)?;
         if unsafe_path.starts_with(store_root) {
             let mut base_path = PathBuf::new();
             unsafe_path.components().take(num_components).for_each(|c| base_path.push(c));
 
-            match store.parse_store_path(base_path.to_str().ok_or_else(|| response.server_error("could not create base path"))?) {
+            match store.parse_store_path(base_path.to_str().ok_or_else(|| std::io::Error::other("could not create base path"))?) {
                 Ok(parsed_path) => Ok((base_path, unsafe_path, parsed_path)),
-                Err(err) => Err(response.server_error(err))
+                Err(err) => Err(std::io::Error::other(err))
             }
         } else {
             // Preserve the code.
-            Err(response.string(0, "not a store path"))
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a store path"))
         }
     } else {
         // May not be a store path. Also preserve the code.
-        Err(response.string(0, "not a path"))
+        Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a path"))
     }
+}
+
+/// Evals a string and then calls the result.
+fn call_fn(
+    func: &str,
+    st: &mut EvalState,
+    value: &Value,
+    dir: &str
+) -> std::io::Result<Value> {
+    let func_val = st.eval_from_string(func, dir)
+        .map_err(std::io::Error::other)?;
+    st.call(func_val, value.clone())
+        .map_err(std::io::Error::other)
+}
+
+/// Evals a string and then calls the result, converting the value to a string.
+/// Returns a tuple of (nix string value, Rust string value).
+fn call_string_fn(
+    func: &str,
+    st: &mut EvalState,
+    value: &Value,
+    dir: &str
+) -> std::io::Result<(Value, String)> {
+    let to_string_value = call_fn(func, st, value, dir)?;
+    let string_value = st.require_string(&to_string_value)
+        .map_err(std::io::Error::other)?;
+    Ok((to_string_value, string_value))
 }
 
 /// Returns a FlackResponse with either a path or text, depending on whether
@@ -399,21 +455,17 @@ fn get_safe_path(
 fn serve_path_or_text(
     response: &mut FlackResponse,
     st: &mut EvalState,
-    dir: &String,
+    dir: &str,
     value: &Value,
     content_type_set: bool
 ) -> Result<FlackResponse, FlackResponse> {
     debug!("Forcing value");
-    let to_string = st.eval_from_string("builtins.toString", dir.as_str())
-        .map_err(|err| response.server_error(err))?;
-    let to_string_value = st.call(to_string, value.clone())
-        .map_err(|err| response.server_error(err))?;
-    let string_value = st.require_string(&to_string_value)
+    let (to_string_value, string_value) = call_string_fn("builtins.toString", st, value, dir)
         .map_err(|err| response.server_error(err))?;
 
     // Could be a string that represents a store path.
     let mut store = st.store().clone();
-    match get_safe_path(response, &mut store, &string_value) {
+    match get_safe_path(&mut store, &string_value) {
         Ok((base_path, path, store_path)) => {
             debug!("Realising store path {:?}", base_path);
             st.realise_string(&to_string_value, false)
@@ -423,18 +475,26 @@ fn serve_path_or_text(
             // Serve the store path.
             Ok(response.ok_path(path.clone()))
         },
-        Err(_) => {
-            // Serve raw text content.
-            debug!("Serving text: {}", response.code);
-            if !content_type_set {
-                // Default to text/plain.
-                let header = header::ContentType::plaintext().try_into_pair()
-                    .map_err(|err| response.server_error(err))?;
-                let key = header.0.to_string();
-                let value = header.1.to_str().map_err(|err| response.server_error(err))?.to_string();
-                response.add_header(key, value);
+        Err(err) => {
+            match err.kind() {
+                std::io::ErrorKind::InvalidInput => {
+                    // Serve raw text content.
+                    debug!("Serving text: {}", response.code);
+                    if !content_type_set {
+                        // Default to text/plain.
+                        let header = header::ContentType::plaintext().try_into_pair()
+                            .map_err(|err| response.server_error(err))?;
+                        let key = header.0.to_string();
+                        let value = header.1.to_str().map_err(|err| response.server_error(err))?.to_string();
+                        response.add_header(key, value);
+                    }
+                    Ok(response.string(0, string_value))
+                },
+                _ => {
+                    error!("Error getting store path: {}", err);
+                    Ok(response.server_error(err))
+                }
             }
-            Ok(response.string(0, string_value))
         }
     }
 }
@@ -533,12 +593,9 @@ async fn flack_handler(req: HttpRequest, request_body: web::Bytes) -> Result<Fla
             };
 
             if let Some(body) = json_body {
-                let from_json = st.eval_from_string("builtins.fromJSON", dir.as_str())
-                    .map_err(|err| response.server_error(err))?;
                 let body_val = st.new_value_str(body)
                     .map_err(|err| response.bad_request(err))?;
-                debug!("fromJSON on body");
-                let body_attrset_val = st.call(from_json, body_val)
+                let body_attrset_val = call_fn("builtins.fromJSON", &mut st, &body_val, &dir)
                     .map_err(|err| response.bad_request(err))?;
                 pairs.push(("flack.body".to_string(), body_attrset_val));
             }
@@ -615,7 +672,7 @@ async fn flack_handler(req: HttpRequest, request_body: web::Bytes) -> Result<Fla
             }
         }
 
-        if body_type == ValueType::String {
+        let ret = if body_type == ValueType::String {
             serve_path_or_text(&mut response, &mut st, &dir, &body, content_type_set)
         } else if body_type == ValueType::AttrSet {
             // Could be a derivation.
@@ -633,15 +690,8 @@ async fn flack_handler(req: HttpRequest, request_body: web::Bytes) -> Result<Fla
                 serve_path_or_text(&mut response, &mut st, &dir, &body, content_type_set)
             } else {
                 // Normal attrset, try to coerce to JSON
-                let to_json = st.eval_from_string("builtins.toJSON", dir.as_str())
+                let (_, json_str) = call_string_fn("builtins.toJSON", &mut st, &body, &dir)
                     .map_err(|err| response.server_error(err))?;
-                debug!("toJSON on result");
-                let json_str_value = st.call(to_json, body)
-                    .map_err(|err| response.server_error(err))?;
-                let json_str = st.require_string(&json_str_value)
-                    .map_err(|err| response.server_error(err))?;
-
-                debug!("Serving attrset as JSON: {}", json_str);
 
                 if !content_type_set {
                     // Default to application/json.
@@ -655,7 +705,19 @@ async fn flack_handler(req: HttpRequest, request_body: web::Bytes) -> Result<Fla
             }
         } else {
             Err(response.server_error("body was not a string or attribute set"))
+        };
+
+        let elapsed = response.stopwatch();
+        if elapsed.as_millis() >= app.args.gc_after as u128 {
+            info!("Request took {}ms, garbage collecting", elapsed.as_millis());
+            gc_now();
+            let gc_elapsed = response.stopwatch();
+            info!("GC took {}ms", gc_elapsed.as_millis());
+        } else {
+            debug!("Request took {}ms", elapsed.as_millis());
         }
+
+        ret
     })
     .await
     .map_err(|err| FlackResponse::new().server_error(err))?
@@ -715,7 +777,7 @@ async fn flack(req: HttpRequest, body: web::Bytes) -> actix_web::Result<HttpResp
 /// The main application entrypoint. In order, we:
 /// - Parse command line arguments
 /// - Connect to the store
-/// - Load the application flake
+/// - Load the application, via flake or `idk`
 /// - Eval the app attribute
 ///
 /// After we have something that we think is a Flack application,
@@ -744,10 +806,6 @@ async fn main() -> std::io::Result<()> {
         .write_style_or("FLACK_LOG_STYLE", args.log_style.as_str());
     env_logger::init_from_env(env);
 
-    args.dir = std::fs::canonicalize(args.dir)?.to_str().unwrap_or(".").to_string();
-
-    info!("Serving project directory: {}", args.dir);
-
     if args.max_connections < 1 {
         // Default the max connections to the available parallelism.
         let max_connections = match std::thread::available_parallelism() {
@@ -770,50 +828,141 @@ async fn main() -> std::io::Result<()> {
     let store = nix_bindings_store::store::Store::open(Some(store_uri.to_string().as_str()), [])
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))?;
 
-    info!("Loading flake: {}", args.flake);
-
-    let (mut st, _guard) = init_get_state(store)
+    // Find out how we're going to load the Nix files.
+    // Either we're passed a flake ref, or an import, which we'll try to resolve using idc.
+    let (mut st, _guard) = init_get_state(store, args.import.is_none())
         .map_err(std::io::Error::other)?;
 
-    // Get the flake.
-    let fetch_settings = nix_bindings_fetchers::FetchersSettings::new()
-        .map_err(std::io::Error::other)?;
-    let flake = get_flake(&mut st, fetch_settings, &args.dir, &args.flake, &std::vec::Vec::new())?;
+    let mut app = if let Some(ref import) = args.import {
+        let import = std::fs::canonicalize(import)?
+            .to_str()
+            .ok_or_else(|| std::io::Error::other("could not create path from import"))?
+            .to_string();
 
-    info!(
-        "Flake loaded successfully: {:?}",
-        st.require_attrs_names(&flake)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
-    );
+        if args.dir == "." {
+            // Pick the directory closest to the import.
+            let meta = std::fs::metadata(&import)?;
+            if meta.is_file() {
+                let import_path = import.clone();
+                args.dir = PathBuf::from_str(import_path.as_str())
+                    .map_err(std::io::Error::other)?
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("could not get parent directory"))?
+                    .to_str()
+                    .ok_or_else(|| std::io::Error::other("could not create path from parent dir"))?
+                    .to_string();
+            } else {
+                args.dir = import.clone();
+            }
+        } else {
+            args.dir = std::fs::canonicalize(args.dir)?
+                .to_str()
+                .ok_or_else(|| std::io::Error::other("could not create path from working directory"))?
+                .to_string();
+        }
 
-    // Get the app.
-    let mut app = flake.clone();
+        args.import = Some(import.clone());
 
-    let attr: Vec<String> = args.attr.split('.').map(str::to_string).collect();
-    for item in &attr {
-        app = match st
-            .require_attrs_select_opt(&app, item)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?
-        {
-            Some(v) => v,
-            None => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("attribute '{}' not found", item))),
-        };
+        info!("Importing project {} from working directory {}", import, args.dir);
+        let import_path_val = st.new_value_str(import.as_str())
+            .map_err(std::io::Error::other)?;
+
+        // No idc options for now, but one would add them here:
+        let imported_val = call_fn(
+            format!("path: ({}) {{ src = builtins.toPath path; }}", include_str!("idc.nix")).as_str(),
+            &mut st,
+            &import_path_val,
+            &args.dir.clone())
+            .map_err(std::io::Error::other)?;
+
+        st.force(&imported_val)
+            .map_err(std::io::Error::other)?;
+
+        info!("Project {} loaded successfully.", import);
+
+        Ok(imported_val.clone())
+    } else {
+        args.dir = std::fs::canonicalize(args.dir)?
+            .to_str()
+            .unwrap_or(".")
+            .to_string();
+
+        info!("Loading flake {} from working directory {}", args.flake, args.dir);
+
+        let mut overrides = Vec::<(String, String)>::new();
+        for pair in args.override_input.chunks(2) {
+            overrides.push((pair[0].to_string(), pair[1].to_string()));
+        }
+
+        // Get the flake.
+        let fetch_settings = nix_bindings_fetchers::FetchersSettings::new()
+            .map_err(std::io::Error::other)?;
+        let flake = get_flake(&mut st, fetch_settings, &args.dir, &args.flake, &overrides)
+            .map_err(std::io::Error::other)?;
+
+        // Set the working directory to the flake's directory.
+        let (_, string_value) = call_string_fn("builtins.toString", &mut st, &flake, &args.dir)?;
+
+        let mut flake_realisation_store = st.store().clone();
+        match get_safe_path(&mut flake_realisation_store, &string_value) {
+            Ok((base_path, _, parsed_path)) => {
+                args.dir = base_path.to_str()
+                    .ok_or_else(|| std::io::Error::other("no path for flake"))?
+                    .to_string();
+
+                info!(
+                    "Flake {} ({}) loaded successfully.",
+                    parsed_path.name().unwrap_or("".to_string()),
+                    args.dir
+                );
+
+                Ok(flake.clone())
+            },
+            Err(err) => {
+                Err(err)
+            }
+        }
+    }?;
+
+    if !args.attr.is_empty() && args.attr != "." {
+        let attr: Vec<String> = args.attr.split('.').map(str::to_string).collect();
+        for item in &attr {
+            app = match st
+                .require_attrs_select_opt(&app, item)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?
+            {
+                Some(v) => {
+                    // Immediately drop the toplevel attribute to save memory.
+                    drop(app);
+                    v
+                },
+                None => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("attribute '{}' not found", item))),
+            };
+        }
     }
+
+    // Run a GC cycle.
+    gc_now();
 
     info!("App loaded successfully.");
 
     let host = args.host.clone();
-    let log_host = args.host.clone();
-    let port = args.port.clone();
+    let port = args.port;
 
     let args_mutex = Arc::new(Mutex::<FlackArgs>::new(args));
     let state_mutex = Arc::new(Mutex::<EvalState>::new(st.clone()));
     let app_mutex = Arc::new(Mutex::<Value>::new(app));
 
-    let server = HttpServer::new(move || {
+    let version: &'static str = env!("CARGO_PKG_VERSION");
+    static SERVER_START: Once = Once::new();
+
+    HttpServer::new(move || {
         let args_data = args_mutex.get_cloned().expect("no args");
         let state_data = state_mutex.get_cloned().expect("no state");
         let app_data = app_mutex.get_cloned().expect("no app");
+
+        let log_host = args_data.host.clone();
+        let log_port = args_data.port;
 
         let app = FlackApp {
             args: args_data,
@@ -822,23 +971,27 @@ async fn main() -> std::io::Result<()> {
             app: Arc::new(Mutex::<Value>::new(app_data))
         };
 
-        App::new()
+        let ret = App::new()
             .wrap(actix_web::middleware::Logger::default())
             .app_data(web::Data::new(app))
-            .default_service(web::route().to(flack))
-    })
-    .bind((host, port))?;
+            .default_service(web::route().to(flack));
 
-    info!(r#"
+        SERVER_START.call_once(|| {
+            info!(r#"
     ________    ___   ________ __
    / ____/ /   /   | / ____/ //_/
   / /_  / /   / /| |/ /   / ,<
  / __/ / /___/ ___ / /___/ /| |
 /_/   /_____/_/  |_\____/_/ |_|
-Bound to {}:{}
-"#, log_host, port);
+v{} bound to {}:{}
+"#, version, log_host, log_port);
 
-    info!("Flack is onstage at {}:{}...", log_host, port);
+            info!("Flack is onstage at {}:{}...", log_host, log_port);
+        });
 
-    server.run().await
+        ret
+    })
+    .bind((host, port))?
+    .run()
+    .await
 }

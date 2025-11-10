@@ -122,6 +122,14 @@ rec {
     # Joins the specified path.
     joinPath = path: normalizePath ("/" + concatStringsSep "/" path);
 
+    # Joins the specified path, converting "/" to "/index.html".
+    joinPathToIndex =
+      path:
+      let
+        joinedPath = joinPath path;
+      in
+      if joinedPath == "/" then "/index.html" else joinedPath;
+
     # Matches a path component.
     matchPathComponent = match "^[^/]+$";
 

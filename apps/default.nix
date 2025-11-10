@@ -1,7 +1,6 @@
 {
   lib,
-  flack,
-  self,
+  inputs,
   ...
 }:
 
@@ -39,7 +38,7 @@
         req:
         let
           # Current system is in `req.system`.
-          pkgs = self.inputs.nixpkgs.legacyPackages.${req.system};
+          pkgs = inputs.nixpkgs.legacyPackages.${req.system};
 
           # req.params.path is automatically a list of path components with :...foo syntax
           pkg = lib.attrByPath req.params.path null pkgs;
@@ -58,7 +57,7 @@
         getNow =
           req:
           let
-            inherit (self.inputs.nixpkgs.legacyPackages.${req.system}) runCommandNoCC;
+            inherit (inputs.nixpkgs.legacyPackages.${req.system}) runCommandNoCC;
           in
 
           # We can use req.id as a source of nondeterminism...
