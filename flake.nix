@@ -5,10 +5,13 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     nixpkgs-lib.url = "github:numinit/nixpkgs.lib";
     flake-parts.url = "github:hercules-ci/flake-parts";
-    flake-compat.url = "https://flakehub.com/f/edolstra/flake-compat/1.tar.gz";
     flakever.url = "github:numinit/flakever";
     nix-cargo-integration.url = "github:90-008/nix-cargo-integration";
-    nix-bindings-rust.url = "github:numinit/nix-bindings-rust";
+    nix-bindings-rust.url = "github:nixops4/nix-bindings-rust";
+    flake-compat = {
+      url = "github:NixOS/flake-compat";
+      flake = false;
+    };
   };
 
   outputs =
