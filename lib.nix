@@ -247,7 +247,7 @@ rec {
                     body = codeHeadersOrBody;
                     flack = [
                       self.code
-                      self.headers
+                      headers
                       body
                     ];
                   }

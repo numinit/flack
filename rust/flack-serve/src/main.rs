@@ -502,6 +502,7 @@ fn serve_path_or_text(
                     debug!("Serving text: {}", response.code);
                     if !content_type_set {
                         // Default to text/plain.
+                        debug!("Defaulting to plaintext");
                         let header = header::ContentType::plaintext()
                             .try_into_pair()
                             .map_err(|err| response.server_error(err))?;
@@ -743,6 +744,7 @@ async fn flack_handler(
             if let Ok(val) = st.require_attrs_select(&res_headers_value, header_name)
                 && let Ok(header_value) = st.require_string(&val)
             {
+                debug!("{}: {}", header_name, header_value);
                 if header_name.eq_ignore_ascii_case("content-type") {
                     content_type_set = true;
                 }
