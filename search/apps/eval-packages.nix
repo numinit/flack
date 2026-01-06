@@ -1,6 +1,68 @@
-{ lib, pkgs, ... }:
+{
+  lib,
+  flack,
+  pkgs,
+  ...
+}:
 
 let
+  inherit (builtins)
+    storeDir
+    ;
+
+  inherit (lib.trivial) isFunction;
+
+  inherit (lib.strings)
+    concatStringsSep
+    splitString
+    hasPrefix
+    removePrefix
+    ;
+
+  inherit (lib.lists)
+    isList
+    length
+    elemAt
+    optional
+    optionals
+    concatLists
+    head
+    take
+    filter
+    ;
+
+  inherit (lib.attrsets)
+    isAttrs
+    isDerivation
+    hasAttr
+    attrsToList
+    mapAttrs
+    mapAttrsToList
+    optionalAttrs
+    ;
+
+  inherit (lib.modules)
+    evalModules
+    ;
+
+  inherit (lib.options)
+    optionAttrSetToDocList
+    ;
+
+  inherit (flack.lib.trivial) tryOrNull tryOrNull';
+
+  inherit (flack.lib.lists) parallel;
+
+  # Returns whether this path refers to a Flack closure (so eval would cause infinite recursion).
+  # Note that we also rule out tests since (at least on 25.05 through 26.05)
+  # they re-import nixpkgs without system set, which breaks in impure mode.
+  isFlackReservedPath =
+    path:
+    let
+      last = (elemAt path (length path - 1));
+    in
+    length path > 0 && (hasPrefix "flack-closure-" last || last == "tests");
+
   /*
     Recursively find all packages (derivations) in `pkgs` matching `cond` predicate.
 
@@ -20,28 +82,31 @@ let
       packagesWithPathInner =
         path: pathContent:
         let
-          result = builtins.tryEval pathContent;
+          result = tryOrNull' pathContent;
         in
-        if result.success then
+        if !(isFlackReservedPath path) && result.success then
           let
             evaluatedPathContent = result.value;
           in
-          if lib.isDerivation evaluatedPathContent then
-            lib.optional (cond path evaluatedPathContent) {
-              name = lib.concatStringsSep "." path;
+          if isDerivation evaluatedPathContent then
+            optional (cond path evaluatedPathContent) {
+              name = concatStringsSep "." path;
               value = evaluatedPathContent;
               inherit extra;
             }
-          else if lib.isAttrs evaluatedPathContent then
+          else if isAttrs evaluatedPathContent then
             # If user explicitly points to an attrSet or it is marked for recursion, we recur.
             if
               path == rootPath
               || evaluatedPathContent.recurseForDerivations or false
               || evaluatedPathContent.recurseForRelease or false
             then
-              lib.concatLists (
-                lib.mapAttrsToList (name: elem: packagesWithPathInner (path ++ [ name ]) elem) evaluatedPathContent
-              )
+              let
+                pathLists = mapAttrsToList (
+                  name: elem: packagesWithPathInner (path ++ [ name ]) elem
+                ) evaluatedPathContent;
+              in
+              concatLists (parallel pathLists pathLists)
             else
               [ ]
           else
@@ -65,8 +130,8 @@ let
     let
       declarations =
         nixpkgs: module:
-        (lib.evalModules {
-          modules = (if lib.isList module then module else [ module ]) ++ [
+        (evalModules {
+          modules = (if isList module then module else [ module ]) ++ [
             (
               { ... }:
               {
@@ -87,25 +152,28 @@ let
       cleanUpOption =
         extraAttrs: opt:
         let
-          applyOnAttr = n: f: lib.optionalAttrs (builtins.hasAttr n opt) { ${n} = f opt.${n}; };
+          applyOnAttr = n: f: optionalAttrs (hasAttr n opt) { ${n} = f opt.${n}; };
           mkDeclaration =
             decl:
             let
-              discard = lib.concatStringsSep "/" (lib.take 4 (lib.splitString "/" decl)) + "/";
-              path = if lib.hasPrefix builtins.storeDir decl then lib.removePrefix discard decl else decl;
+              discard = concatStringsSep "/" (take 4 (splitString "/" decl)) + "/";
+              path = if hasPrefix storeDir decl then removePrefix discard decl else decl;
             in
             path;
 
           # Replace functions by the string <function>
           substFunction =
             x:
-            if !(builtins.tryEval x).success then
+            let
+              x' = tryOrNull x;
+            in
+            if x' == null then
               "eval error"
-            else if builtins.isAttrs x then
-              lib.mapAttrs (_: substFunction) x
-            else if builtins.isList x then
-              map substFunction x
-            else if lib.isFunction x then
+            else if isAttrs x' then
+              mapAttrs (_: substFunction) x'
+            else if isList x' then
+              map substFunction x'
+            else if isFunction x' then
               "function"
             else
               x;
@@ -131,18 +199,18 @@ let
       modulePath ? null,
     }:
     let
-      opts = lib.optionAttrSetToDocList (declarations nixpkgs module);
+      opts = optionAttrSetToDocList (declarations nixpkgs module);
       extraAttrs =
-        lib.optionalAttrs (modulePath != null) {
+        optionalAttrs (modulePath != null) {
           inherit modulePath;
         }
         // {
           inherit extra;
         };
+      filtered = parallel opts (filter (x: x.visible && !x.internal && head x.loc != "_module") opts);
+      cleaned = parallel filtered (map (cleanUpOption extraAttrs) filtered);
     in
-    map (cleanUpOption extraAttrs) (
-      lib.filter (x: x.visible && !x.internal && lib.head x.loc != "_module") opts
-    );
+    cleaned;
 
   # Gets options under the specified flake.
   flakeOptionsUnder =
@@ -155,13 +223,13 @@ let
       urlOverride ? name: url: url,
     }:
     let
-      nixosModulesOpts = lib.concatLists (
-        lib.mapAttrsToList (
+      nixosModulesOpts = concatLists (
+        mapAttrsToList (
           moduleName: module:
           readNixOSOptions {
             inherit nixpkgs extra module;
             modulePath =
-              lib.optionals (flake ? url) [
+              optionals (flake ? url) [
                 (urlOverride name flake.url)
               ]
               ++ [
@@ -171,10 +239,10 @@ let
         ) (resolved.nixosModules or { })
       );
 
-      nixosModuleOpts = lib.optionals (resolved ? nixosModule) (readNixOSOptions {
+      nixosModuleOpts = optionals (resolved ? nixosModule) (readNixOSOptions {
         inherit nixpkgs extra;
         module = resolved.nixosModule;
-        modulePath = lib.optional (flake ? url) (urlOverride name flake.url);
+        modulePath = optional (flake ? url) (urlOverride name flake.url);
       });
     in
     # We assume that `nixosModules` includes `nixosModule` when there
@@ -193,5 +261,10 @@ let
     };
 in
 {
-  inherit packagesUnder flakeOptionsUnder nixosOptionsUnder;
+  inherit
+    packagesUnder
+    flakeOptionsUnder
+    nixosOptionsUnder
+    isFlackReservedPath
+    ;
 }

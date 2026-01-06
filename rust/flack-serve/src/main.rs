@@ -11,7 +11,7 @@ use std::num::NonZero;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, Once};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::{debug, error, info, warn};
 
@@ -22,7 +22,7 @@ use actix_web::{
     App, Either, HttpMessage, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, mime, web,
 };
 
-use nix_bindings_expr::eval_state::gc_now;
+use nix_bindings_expr::eval_state::{gc_now, RealisedString};
 use uuid::Uuid;
 
 use clap::Parser;
@@ -57,6 +57,14 @@ struct FlackArgs {
     /// Overrides to the given flake's inputs.
     #[arg(short = 'o', long, num_args = 2)]
     override_input: Vec<String>,
+
+    /// Pass to skip preloading the app.
+    #[arg(short = 'n', long, action, default_value_t = false)]
+    no_preload: bool,
+
+    /// Pass to disable substitution during preload.
+    #[arg(long, action, default_value_t = false)]
+    no_preload_substitute: bool,
 
     /// The flake attribute containing the Flack app
     #[arg(short = 'a', long, default_value = "flack.apps.default")]
@@ -244,17 +252,37 @@ fn get_gc_guard() -> std::io::Result<ThreadRegistrationGuard> {
 
 /// Initializes the evaluator.
 fn init_get_gc_guard() -> std::io::Result<ThreadRegistrationGuard> {
-    nix_bindings_expr::eval_state::init().map_err(std::io::Error::other)?;
+        nix_bindings_expr::eval_state::init().map_err(std::io::Error::other)?;
 
     get_gc_guard()
 }
 
 /// Gets a new EvalState for the specified store.
 fn init_get_state(
+    args: FlackArgs,
     store: Store,
+    cores: u32,
     flakes: bool,
 ) -> std::io::Result<(EvalState, ThreadRegistrationGuard)> {
     let gc_guard = init_get_gc_guard()?;
+
+    if let Err(err) = nix_bindings_util::settings::set("experimental-features", "parallel-eval pipe-operators") {
+        warn!("Couldn't enable parallel evaluation: {:?}", err);
+    }
+
+    if let Err(err) = nix_bindings_util::settings::set("eval-cores", format!("{}", cores).as_str()) {
+        warn!("Couldn't set eval-cores: {:?}", err);
+    }
+
+    if args.log_level == "debug" {
+        if let Err(err) = nix_bindings_util::settings::set("trace-verbose", "true") {
+            warn!("Couldn't enable verbose tracing: {:?}", err);
+        }
+
+        if let Err(err) = nix_bindings_util::settings::set("show-trace", "true") {
+            warn!("Couldn't enable verbose tracing: {:?}", err);
+        }
+    }
 
     let mut state_builder = nix_bindings_expr::eval_state::EvalStateBuilder::new(store)
         .map_err(std::io::Error::other)?;
@@ -539,6 +567,7 @@ async fn flack_handler(
     let port = app.args.port;
 
     let http_version = format!("{:?}", req.version());
+    let now = format!("{:?}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
     let request_id = Uuid::now_v7().to_string();
     let str_inputs = [
         ("RACK", "flack".to_string()),
@@ -553,6 +582,7 @@ async fn flack_handler(
         ),
         ("flack.system", app.system.to_string()),
         ("flack.request_id", request_id),
+        ("flack.request_timestamp", now),
     ];
     let int_inputs = [("SERVER_PORT", port as i64)];
 
@@ -697,8 +727,8 @@ async fn flack_handler(
         let length = st
             .require_list_size(&res)
             .map_err(|err| response.server_error(err))?;
-        if length != 3 {
-            return Err(response.server_error("result of flack app did not have length 3"));
+        if length < 3 {
+            return Err(response.server_error("result of flack app did not have length of at least 3"));
         }
         let code_val = match st
             .require_list_select_idx_strict(&res, 0)
@@ -741,7 +771,8 @@ async fn flack_handler(
 
         let mut content_type_set: bool = false;
         for header_name in res_headers_names.iter() {
-            if let Ok(val) = st.require_attrs_select(&res_headers_value, header_name)
+            if !header_name.starts_with("_") && !header_name.ends_with("'")
+                && let Ok(val) = st.require_attrs_select(&res_headers_value, header_name)
                 && let Ok(header_value) = st.require_string(&val)
             {
                 debug!("{}: {}", header_name, header_value);
@@ -858,6 +889,208 @@ async fn flack(req: HttpRequest, body: web::Bytes) -> actix_web::Result<HttpResp
     }
 }
 
+/// Preloads the Flack app.
+fn preload(args: FlackArgs, st: &mut EvalState, project: Value, app: Value) -> std::io::Result<RealisedString> {
+    let maybe_closure_fn = st.require_attrs_select_opt(&app, "mkClosure")
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
+
+    if let Some(closure_fn) = maybe_closure_fn {
+        let prev_substitute = nix_bindings_util::settings::get("substitute").unwrap_or("true".to_string());
+        if args.no_preload_substitute {
+            nix_bindings_util::settings::set("substitute", "false")
+                .map_err(std::io::Error::other)?;
+        }
+
+        let system = nix_bindings_util::settings::get("system").unwrap_or("unknown".to_string());
+        let system_val = st.new_value_str(system.as_str())
+            .map_err(std::io::Error::other)?;
+
+        let params = st
+            .new_value_attrs(
+                vec![
+                    ("system".to_string(), system_val),
+                    ("self".to_string(), project.clone())
+                ]
+            )
+            .map_err(std::io::Error::other)?;
+
+        let closure = st.call(closure_fn, params)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        st.force(&closure)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let (to_string_value, _string_value) = call_string_fn(
+            "builtins.toString", st, &closure, &args.dir
+        )?;
+
+        // Allow IFD for app preloading.
+        let realised = st.realise_string(&to_string_value, true)
+            .map_err(std::io::Error::other)?;
+
+        if args.no_preload_substitute {
+            nix_bindings_util::settings::set("substitute", prev_substitute.as_str())
+                .map_err(std::io::Error::other)?;
+        }
+
+        Ok(realised)
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no mkClosure"))
+    }
+}
+
+/// Imports a project with idc.
+fn import_idc_project(args: &mut FlackArgs, st: &mut EvalState, name: String, path: String, toplevel: bool) -> std::io::Result<Value> {
+    let import = std::fs::canonicalize(path)?
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("could not create path from import"))?
+        .to_string();
+
+    if toplevel {
+        if args.dir == "." {
+            // Pick the directory closest to the import.
+            let meta = std::fs::metadata(&import)?;
+            if meta.is_file() {
+                let import_path = import.clone();
+                args.dir = PathBuf::from_str(import_path.as_str())
+                    .map_err(std::io::Error::other)?
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("could not get parent directory"))?
+                    .to_str()
+                    .ok_or_else(|| std::io::Error::other("could not create path from parent dir"))?
+                    .to_string();
+            } else {
+                args.dir = import.clone();
+            }
+        } else {
+            args.dir = std::fs::canonicalize(args.dir.clone())?
+                .to_str()
+                .ok_or_else(|| {
+                    std::io::Error::other("could not create path from working directory")
+                })?
+                .to_string();
+        }
+
+        args.import = Some(import.clone());
+
+        info!(
+            "Importing toplevel project ({}) from working directory {}",
+            import, args.dir
+        );
+    } else {
+        info!(
+            "Importing overridden project '{}' ({}) from working directory {}",
+            name, import, args.dir
+        );
+    }
+
+    let import_path_val = st
+        .new_value_str(import.as_str())
+        .map_err(std::io::Error::other)?;
+
+    let mut overrides: Vec<(String, Value)> = Vec::with_capacity(args.override_input.len());
+
+    if toplevel {
+        // Don't override inputs for subprojects
+        for pair in args.override_input.clone().chunks(2) {
+            match import_idc_project(args, st, pair[0].to_string(), pair[1].to_string(), false) {
+                Ok(val) => {
+                    overrides.push((pair[0].to_string(), val));
+                },
+                Err(err) => {
+                    error!("Error importing project '{}' ({}): {:?}", pair[0], pair[1], err);
+                }
+            }
+        }
+    }
+
+    let overrides_val = st
+        .new_value_attrs(overrides)
+        .map_err(std::io::Error::other)?;
+
+    let settings_val = st
+        .new_value_attrs(
+            vec![
+                ("inputs".to_string(), overrides_val.clone()),
+                ("override".to_string(), overrides_val.clone())
+            ]
+        )
+        .map_err(std::io::Error::other)?;
+
+    let args_val = st
+        .new_value_attrs(
+            vec![
+                ("path".to_string(), import_path_val.clone()),
+                ("settings".to_string(), settings_val.clone())
+            ]
+        )
+        .map_err(std::io::Error::other)?;
+
+    let imported_val = call_fn(
+        format!(
+            "{{ path, settings ? {{}} }}: ({}) {{ src = builtins.toPath path; inherit settings; }}",
+            include_str!("idc.nix")
+        )
+        .as_str(),
+        st,
+        &args_val,
+        &args.dir.clone(),
+    )
+    .map_err(std::io::Error::other)?;
+
+    st.force(&imported_val).map_err(std::io::Error::other)?;
+
+    info!("Project '{}' ({}) loaded successfully.", name, import);
+
+    Ok(imported_val.clone())
+}
+
+/// Imports a flake.
+fn import_flake(args: &mut FlackArgs, st: &mut EvalState) -> std::io::Result<Value> {
+    args.dir = std::fs::canonicalize(args.dir.clone())?
+        .to_str()
+        .unwrap_or(".")
+        .to_string();
+
+    info!(
+        "Loading flake {} from working directory {}",
+        args.flake, args.dir
+    );
+
+    let mut overrides = Vec::<(String, String)>::new();
+    for pair in args.override_input.chunks(2) {
+        overrides.push((pair[0].to_string(), pair[1].to_string()));
+    }
+
+    // Get the flake.
+    let fetch_settings =
+        nix_bindings_fetchers::FetchersSettings::new().map_err(std::io::Error::other)?;
+    let flake = get_flake(st, fetch_settings, &args.dir, &args.flake, &overrides)
+        .map_err(std::io::Error::other)?;
+
+    // Set the working directory to the flake's directory.
+    let (_, string_value) = call_string_fn("builtins.toString", st, &flake, &args.dir)?;
+
+    let mut flake_realisation_store = st.store().clone();
+    match get_safe_path(&mut flake_realisation_store, &string_value) {
+        Ok((base_path, _, parsed_path)) => {
+            args.dir = base_path
+                .to_str()
+                .ok_or_else(|| std::io::Error::other("no path for flake"))?
+                .to_string();
+
+            info!(
+                "Flake {} ({}) loaded successfully.",
+                parsed_path.name().unwrap_or("".to_string()),
+                args.dir
+            );
+
+            Ok(flake.clone())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// The main application entrypoint. In order, we:
 /// - Parse command line arguments
 /// - Connect to the store
@@ -883,6 +1116,7 @@ async fn flack(req: HttpRequest, body: web::Bytes) -> actix_web::Result<HttpResp
 /// in the parallel eval branch.
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    let version: &'static str = env!("CARGO_PKG_VERSION");
     let mut args = FlackArgs::parse();
 
     let env = env_logger::Env::default()
@@ -890,16 +1124,17 @@ async fn main() -> std::io::Result<()> {
         .write_style_or("FLACK_LOG_STYLE", args.log_style.as_str());
     env_logger::init_from_env(env);
 
+    let cores = match std::thread::available_parallelism() {
+        Ok(val) => val,
+        Err(err) => {
+            warn!("Error getting parallelism, defaulting to 1: {:?}", err);
+            NonZero::new(1).unwrap()
+        }
+    };
+
     if args.max_connections < 1 {
         // Default the max connections to the available parallelism.
-        let max_connections = match std::thread::available_parallelism() {
-            Ok(val) => val,
-            Err(err) => {
-                warn!("Error getting parallelism, defaulting to 1: {:?}", err);
-                NonZero::new(1).unwrap()
-            }
-        };
-        args.max_connections = max_connections.get() as u16;
+        args.max_connections = cores.get() as u16;
     }
 
     let store_uri = url::Url::parse_with_params(
@@ -911,6 +1146,8 @@ async fn main() -> std::io::Result<()> {
     )
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
+    info!("Flack {} early startup", version);
+
     info!("Connecting to store: {}", store_uri);
 
     let store = nix_bindings_store::store::Store::open(Some(store_uri.to_string().as_str()), [])
@@ -919,111 +1156,15 @@ async fn main() -> std::io::Result<()> {
     // Find out how we're going to load the Nix files.
     // Either we're passed a flake ref, or an import, which we'll try to resolve using idc.
     let (mut st, _guard) =
-        init_get_state(store, args.import.is_none()).map_err(std::io::Error::other)?;
+        init_get_state(args.clone(), store, cores.get() as u32, args.import.is_none()).map_err(std::io::Error::other)?;
 
-    let mut app = if let Some(ref import) = args.import {
-        let import = std::fs::canonicalize(import)?
-            .to_str()
-            .ok_or_else(|| std::io::Error::other("could not create path from import"))?
-            .to_string();
-
-        if args.dir == "." {
-            // Pick the directory closest to the import.
-            let meta = std::fs::metadata(&import)?;
-            if meta.is_file() {
-                let import_path = import.clone();
-                args.dir = PathBuf::from_str(import_path.as_str())
-                    .map_err(std::io::Error::other)?
-                    .parent()
-                    .ok_or_else(|| std::io::Error::other("could not get parent directory"))?
-                    .to_str()
-                    .ok_or_else(|| std::io::Error::other("could not create path from parent dir"))?
-                    .to_string();
-            } else {
-                args.dir = import.clone();
-            }
-        } else {
-            args.dir = std::fs::canonicalize(args.dir)?
-                .to_str()
-                .ok_or_else(|| {
-                    std::io::Error::other("could not create path from working directory")
-                })?
-                .to_string();
-        }
-
-        args.import = Some(import.clone());
-
-        info!(
-            "Importing project {} from working directory {}",
-            import, args.dir
-        );
-        let import_path_val = st
-            .new_value_str(import.as_str())
-            .map_err(std::io::Error::other)?;
-
-        // No idc options for now, but one would add them here:
-        let imported_val = call_fn(
-            format!(
-                "path: ({}) {{ src = builtins.toPath path; }}",
-                include_str!("idc.nix")
-            )
-            .as_str(),
-            &mut st,
-            &import_path_val,
-            &args.dir.clone(),
-        )
-        .map_err(std::io::Error::other)?;
-
-        st.force(&imported_val).map_err(std::io::Error::other)?;
-
-        info!("Project {} loaded successfully.", import);
-
-        Ok(imported_val.clone())
+    let project = if let Some(ref import) = args.import.clone() {
+        import_idc_project(&mut args, &mut st, "app".to_string(), import.to_string(), true)?
     } else {
-        args.dir = std::fs::canonicalize(args.dir)?
-            .to_str()
-            .unwrap_or(".")
-            .to_string();
+        import_flake(&mut args, &mut st)?
+    };
 
-        info!(
-            "Loading flake {} from working directory {}",
-            args.flake, args.dir
-        );
-
-        let mut overrides = Vec::<(String, String)>::new();
-        for pair in args.override_input.chunks(2) {
-            overrides.push((pair[0].to_string(), pair[1].to_string()));
-        }
-
-        // Get the flake.
-        let fetch_settings =
-            nix_bindings_fetchers::FetchersSettings::new().map_err(std::io::Error::other)?;
-        let flake = get_flake(&mut st, fetch_settings, &args.dir, &args.flake, &overrides)
-            .map_err(std::io::Error::other)?;
-
-        // Set the working directory to the flake's directory.
-        let (_, string_value) = call_string_fn("builtins.toString", &mut st, &flake, &args.dir)?;
-
-        let mut flake_realisation_store = st.store().clone();
-        match get_safe_path(&mut flake_realisation_store, &string_value) {
-            Ok((base_path, _, parsed_path)) => {
-                args.dir = base_path
-                    .to_str()
-                    .ok_or_else(|| std::io::Error::other("no path for flake"))?
-                    .to_string();
-
-                info!(
-                    "Flake {} ({}) loaded successfully.",
-                    parsed_path.name().unwrap_or("".to_string()),
-                    args.dir
-                );
-
-                Ok(flake.clone())
-            }
-            Err(err) => Err(err),
-        }
-    }?;
-
+    let mut app = project.clone();
     if !args.attr.is_empty() && args.attr != "." {
         let attr: Vec<String> = args.attr.split('.').map(str::to_string).collect();
         for item in &attr {
@@ -1056,15 +1197,20 @@ async fn main() -> std::io::Result<()> {
 
     let args_mutex = Arc::new(Mutex::<FlackArgs>::new(args));
     let state_mutex = Arc::new(Mutex::<EvalState>::new(st.clone()));
+    let project_mutex = Arc::new(Mutex::<Value>::new(project));
     let app_mutex = Arc::new(Mutex::<Value>::new(app));
 
-    let version: &'static str = env!("CARGO_PKG_VERSION");
     static SERVER_START: Once = Once::new();
 
     HttpServer::new(move || {
         let args_data = args_mutex.get_cloned().expect("no args");
         let state_data = state_mutex.get_cloned().expect("no state");
         let app_data = app_mutex.get_cloned().expect("no app");
+
+        let preload_args = args_mutex.get_cloned().expect("no preload args");
+        let mut preload_state = state_mutex.get_cloned().expect("no preload state");
+        let preload_project = project_mutex.get_cloned().expect("no preload project");
+        let preload_app = app_mutex.get_cloned().expect("no preload app");
 
         let log_host = args_data.host.clone();
         let log_port = args_data.port;
@@ -1093,6 +1239,38 @@ v{} bound to {}:{}
 "#,
                 version, log_host, log_port
             );
+
+            // Force the whole app closure to preload it.
+            // Note that this is async and we discard the result to finish starting the server.
+            #[allow(unused_must_use)]
+            web::block(move || {
+                if preload_args.no_preload {
+                    info!("Skipping app preload");
+                    return
+                }
+
+                info!("Preloading app...");
+                let _guard = get_gc_guard();
+
+                let preload_start = Instant::now();
+                match preload(preload_args, &mut preload_state, preload_project, preload_app) {
+                    Ok(closure) => {
+                        info!("App preloaded: {}", closure.s);
+                    },
+                    Err(err) => {
+                        error!("App preload failed: {:?}", err);
+                    }
+                }
+
+                let preload_duration = Instant::now().saturating_duration_since(preload_start);
+                info!("Preload took {}ms", preload_duration.as_millis());
+
+                let gc_start = Instant::now();
+                gc_now();
+                let gc_duration = Instant::now().saturating_duration_since(gc_start);
+
+                info!("GC took {}ms", gc_duration.as_millis());
+            });
 
             info!("Flack is onstage at {}:{}...", log_host, log_port);
         });

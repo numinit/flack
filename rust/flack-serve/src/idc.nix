@@ -12,6 +12,7 @@
   specific language governing permissions and limitations
   under the License.
 */
+
 let
   /*
     Copyright (c) 2020-2021 Eelco Dolstra and the flake-compat contributors
@@ -46,6 +47,14 @@ let
 
         strings = {
           when = condition: string: if condition then string else "";
+
+          maybePath =
+            args:
+            let
+              path' = builtins.path args;
+              tryPath = builtins.tryEval path';
+            in
+            if tryPath.success then tryPath.value or args.path else args.path;
         };
 
         hash = {
@@ -99,7 +108,7 @@ let
 
       fetchurl =
         { url, sha256 }:
-        builtins.path {
+        lib.strings.maybePath {
           name = "source";
           recursive = true;
           path = builtins.derivation {
@@ -130,13 +139,13 @@ let
         };
 
       fetch =
-        info:
+        root: info:
         if info.type == "path" then
           {
-            outPath = builtins.path (
+            outPath = lib.strings.maybePath (
               {
                 name = "source";
-                inherit (info) path;
+                path = "${root.outPath}/${info.path}";
               }
               // lib.hash.from.info info
             );
@@ -155,10 +164,10 @@ let
             }
           else if builtins.substring 0 7 info.url == "file://" then
             {
-              outPath = builtins.path (
+              outPath = lib.strings.maybePath (
                 {
                   name = "source";
-                  path = builtins.substring 7 (-1) info.url;
+                  path = "${root.outPath}/${builtins.substring 7 (-1) info.url}";
                 }
                 // lib.hash.from.info info
               );
@@ -263,7 +272,7 @@ let
                   {
                     outPath =
                       if builtins.isPath src then
-                        builtins.path {
+                        lib.strings.maybePath {
                           name = "source";
                           path = src;
                         }
@@ -284,7 +293,7 @@ let
                 if name == lock.root then
                   root
                 else
-                  fetch (node.info or { } // builtins.removeAttrs node.locked [ "dir" ]);
+                  fetch root (node.info or { } // builtins.removeAttrs node.locked [ "dir" ]);
 
               subdir = if name == lock.root then "" else node.locked.dir or "";
 

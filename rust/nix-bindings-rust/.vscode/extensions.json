@@ -1,0 +1,9 @@
+{
+  "recommendations": [
+    "mkhl.direnv",
+    "rust-lang.rust-analyzer"
+  ],
+  "unwantedRecommendations": [
+    "llvm-vs-code-extensions.vscode-clangd"
+  ]
+}

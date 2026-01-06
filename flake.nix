@@ -1,13 +1,14 @@
 {
   description = "Serve your flakes";
   inputs = {
-    nix.url = "github:DeterminateSystems/nix-src";
+    nix.url = "github:numinit/nix/flack";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     nixpkgs-lib.url = "github:numinit/nixpkgs.lib";
+    flack-lib.url = ./lib;
     flake-parts.url = "github:hercules-ci/flake-parts";
     flakever.url = "github:numinit/flakever";
     nix-cargo-integration.url = "github:90-008/nix-cargo-integration";
-    nix-bindings-rust.url = "github:nixops4/nix-bindings-rust";
+    nix-bindings-rust.url = ./rust/nix-bindings-rust;
     flake-compat = {
       url = "github:NixOS/flake-compat";
       flake = false;
@@ -19,6 +20,7 @@
       self,
       nix,
       nixpkgs-lib,
+      flack-lib,
       flake-parts,
       flakever,
       ...
@@ -33,7 +35,7 @@
           2
         ];
       };
-      inherit (nixpkgs-lib) lib;
+      inherit (flack-lib) flack;
     in
     flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [
@@ -46,25 +48,20 @@
         versionTemplate = "0.2-<lastModifiedDate>-<rev>";
         inherit (flakeverConfig) version versionCode;
 
-        flack =
-          let
-            flack = import ./flack.nix lib;
-          in
-          flack
-          // {
-            apps.default = flack.mkApp {
-              modules = [ ./apps ];
-              specialArgs = {
-                inherit inputs;
-              };
-            };
-
-            apps.simple = flack.mkApp {
-              route = {
-                GET."/" = req: req.res 200 "Hello, Flack!\n";
-              };
+        flack = {
+          apps.default = flack.mkApp {
+            modules = [ ./apps ];
+            specialArgs = {
+              inherit inputs;
             };
           };
+
+          apps.simple = flack.mkApp {
+            route = {
+              GET."/" = req: req.res 200 "Hello, Flack!\n";
+            };
+          };
+        };
       };
 
       systems = [
@@ -112,8 +109,20 @@
           };
 
           packages = rec {
-            flack = outputs."flack".packages.release;
             default = flack;
+            flack = outputs."flack".packages.release;
+            flack-closure-default = self.flack.apps.default.mkClosure {
+              inherit system;
+              pkgs = final;
+              inherit self;
+              flack = self;
+            };
+            flack-closure-simple = self.flack.apps.simple.mkClosure {
+              inherit system;
+              pkgs = final;
+              inherit self;
+              flack = self;
+            };
           };
 
           legacyPackages.flack = packages.flack;
@@ -124,7 +133,10 @@
 
           devShells = {
             default = outputs."flack".devShell.overrideAttrs (prev: {
-              buildInputs = prev.buildInputs or [ ] ++ [ pkgs.gdb ];
+              buildInputs = prev.buildInputs or [ ] ++ [
+                pkgs.gdb
+                nix.packages.${system}.default
+              ];
             });
           };
         };
