@@ -56,6 +56,7 @@ let
           (h "h1" "Flack the Planet")
           (h "h2" "The web framework no one asked for.")
           (h "h3" "mjones (@numinit)")
+          (h "h4" (h "a" { href = "https://github.com/numinit/flack"; } "https://github.com/numinit/flack"))
         ])
         (h "section" [
           (h "h1" "What is this?")
