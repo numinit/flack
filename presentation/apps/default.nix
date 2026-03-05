@@ -389,7 +389,7 @@ let
       (h "article" [
         (h "header" [
           (h "h1" "Can we use it to write things where we'd ordinarily use nix repl?")
-          (h "h2" (h "a" { href = "http://localhost:2021"; target = "_blank"; } "Hmmmm... 🤔"))
+          (h "h2" (h "a" { href = "https://search.flack.dev"; target = "_blank"; } "Hmmmm... 🤔"))
         ])
       ])
     ];
