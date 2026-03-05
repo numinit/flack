@@ -17,6 +17,8 @@
 # By default, flack serves flack.apps.default, though this can be changed
 # on the command line of flack-serve.
 {
+  name = "flack-demo";
+
   mount = {
     /*
       This is a mountpoint.
@@ -86,7 +88,7 @@
       Note the auth token above!
       `curl -H 'X-Auth-Token: supersecret' http://localhost:2019/foo/myBar`
     */
-    GET."/foo/:bar" =
+    GET."/foo/:...bar" =
       req:
       req.res 200 { "X-My-Header" = "value"; } {
         inherit (req) pathComponents;
@@ -99,14 +101,17 @@
       `curl -X POST -H 'X-Auth-Token: supersecret' -H 'Content-Type: application/json' \
        -d '{"baz": "quux"}' http://localhost:2019/foo/myBar`
     */
-    POST."/foo/:bar" =
+    POST."/foo/:...bar" =
       req:
       req.res 201 {
         inherit (req.params) bar;
         inherit (req) body;
       };
 
-    # This is another route. We can omit headers if we just want a JSON body.
+    # This is another route with a content type.
     GET."/" = req: req.res 200 { "Content-Type" = "text/markdown"; } "Hello, Flack!\n";
+
+    # This is another route. We can omit headers if we just want a JSON body.
+    GET."/foo.json" = req: req.res 200 { hello = "flack!"; };
   };
 }

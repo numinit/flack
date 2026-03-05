@@ -45,7 +45,7 @@ let
   # Creates a type that's a Flack handler.
   handler = with types; functionTo attrs;
 
-  # The toplevel app type.
+  # The app type.
   app = {
     use = mkOption {
       type = routerOf handler;
@@ -66,5 +66,15 @@ let
   };
 in
 {
-  options = app;
+  # The toplevel app type.
+  options = app // {
+    name = mkOption {
+      type = types.str;
+    };
+
+    devDependencies = mkOption {
+      type = with types; listOf str;
+      default = [ ];
+    };
+  };
 }

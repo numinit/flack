@@ -1,0 +1,127 @@
+/* Border-box all the things */
+* {
+  box-sizing: border-box;
+}
+
+/* Cover the whole screen */
+html,
+body {
+  block-size: 100%;
+}
+
+iframe {
+    border: 0;
+    width: 100%;
+    overflow: hidden;
+}
+
+/* This is the slide deck */
+article {
+  /* Cover the screen */
+  block-size: 100%;
+  /* Make it a flex container */
+  display: flex;
+  /* Make it a scroll container */
+  overflow-x: scroll;
+  /* Make inline scrolling snap */
+  scroll-snap-type: x mandatory;
+  /* Use inline axis for scrolling where supported */
+  @supports (overflow-inline: scroll) {
+    overflow-inline: scroll;
+    scroll-snap-type: inline mandatory;
+  }
+  /* Set up a slide counter */
+  counter-reset: slide;
+}
+
+/* These are the slides */
+article > * {
+  /* Fill the scroll container */
+  flex: 0 0 100%;
+  /* Scroll to the start of the slide */
+  scroll-snap-align: start;
+  /* Increment the slide counter */
+  counter-increment: slide;
+}
+
+/* This is the counter */
+article > ::before {
+  /* Display the counter */
+  content: counter(slide);
+}
+
+/* This is a cover layout for the first slide */
+article > :first-child {
+  display: grid;
+  place-content: center;
+  text-align: center;
+  padding-inline: 4rem;
+  font-size: clamp(1rem, 1rem + 2vw, 3rem);
+  line-height: 1.3;
+}
+
+/******************************************************
+ Presentational styles (not required for the technique) 
+ ******************************************************/
+
+:root {
+  --foreground: #000;
+  --background: #fff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --foreground: #fff;
+    --background: #000;
+  }
+}
+
+body {
+  margin: 0;
+  font-family: Avenir Next, system-ui;
+  background-color: var(--background);
+  color: var(--foreground);
+}
+
+article {
+  scrollbar-color: var(--foreground) transparent;
+  scrollbar-width: thin;
+}
+
+/* Make each slide a grid layout */
+article > * {
+  position: relative;
+  display: grid;
+  grid-auto-flow: row;
+  grid-template-rows: max-content;
+  row-gap: 1rem;
+  padding: 2rem;
+  font-size: 1.5rem;
+}
+
+/* Style the slide counter */
+article > ::before {
+  position: absolute;
+  inset-block-start: 1rem;
+  inset-inline-end: 1rem;
+  padding: 0.75rem;
+  font-size: 1rem;
+  font-weight: 700;
+  font-variant: tabular-nums;
+  line-height: 1;
+  background-color: var(--foreground);
+  color: var(--background);
+  clip-path: circle();
+}
+
+/* Remove margin for slide content */
+article > * > * {
+  margin: 0;
+}
+
+/* For all none cover layouts set the heading size */
+article > * + * > :first-child {
+  font-size: 2em;
+}
+
+

@@ -1,0 +1,26 @@
+{
+  "nodes": {
+    "nixpkgs-lib": {
+      "locked": {
+        "lastModified": 1760916757,
+        "narHash": "sha256-6i3cviWoRl1w8OANUaEAqHDRIHwsqDSAh0ssWKAp7G8=",
+        "owner": "numinit",
+        "repo": "nixpkgs.lib",
+        "rev": "ae92e47483bdf80f3ecfae626344806d81b69613",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numinit",
+        "repo": "nixpkgs.lib",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs-lib": "nixpkgs-lib"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

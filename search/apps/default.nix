@@ -11,7 +11,6 @@ let
     ;
 
   inherit (lib.trivial)
-    isInt
     max
     min
     ;
@@ -29,6 +28,8 @@ let
     splitString
     ;
 
+  inherit (lib.versions) majorMinor;
+
   inherit (lib.lists)
     isList
     elemAt
@@ -43,21 +44,44 @@ let
     flatten
     findFirst
     singleton
+    optional
     ;
 
   inherit (lib.attrsets)
     optionalAttrs
     filterAttrs
     attrsToList
+    attrValues
     ;
 
+  inherit (flack.lib.trivial) coerceInt tryOr tryOrNull;
+
+  inherit (flack.lib.strings) emptyToNull nullToEmpty coerceString;
+
+  inherit (flack.lib.lists) coerceList parallel;
+
   inherit (flack.lib.paths) joinPathToIndex;
+
+  inherit (flack.lib.log) mkLog;
+
+  name = "flack-search";
+
+  Log = mkLog name;
 in
 {
+  inherit name;
+
+  # We don't need this flake input at runtime (but will bundle the compiled version).
+  # Also don't bundle the flake, it's just used for overrides.
+  devDependencies = [
+    "nixos-search"
+    "flake"
+  ];
+
   route =
     let
       getFrontend =
-        req: path: "${inputs'.nixos-search.packages.${req.system}.frontend}/${joinPathToIndex path}";
+        req: path: "${inputs'.nixos-search.packages.${req.system}.frontend}${joinPathToIndex path}";
     in
     rec {
       # These allow us to serve a static site with Flack.
@@ -75,436 +99,533 @@ in
       route.POST."/:version/_search" =
         req:
         let
-          coerceInt = val: if isInt val then val else 0;
-          coerceString = val: if isString val then val else null;
-          coerceList = val: if isList val then val else [ ];
-
-          # Pull all the filters out of the search query.
-          filters = filter (x: x != null) (
-            map (x: coerceString (x.term.type._name or null)) (coerceList (req.body.query.bool.filter or [ ]))
-          );
-
-          # True if we are searching packages.
-          isPackageSearch = findFirst (x: x == "filter_packages") null filters != null;
-
-          # Likewise for options.
-          isOptionSearch = findFirst (x: x == "filter_options") null filters != null;
-
-          # The search parameter for the current search mode.
-          searchParam =
-            if isPackageSearch then
-              "package_attr_name"
-            else if isOptionSearch then
-              "option_name"
-            else
-              # default to package search
-              "package_attr_name";
-
-          # Pull all of the must parameters out of the search query.
-          normalizeQuery = query: toLower (removePrefix "*" (removeSuffix "*" query));
-          musts = map normalizeQuery (
-            flatten (
-              map (
-                must:
-                filter (x: x != null) (
-                  map (query: coerceString (query.wildcard.${searchParam}.value or null)) (
-                    coerceList (must.dis_max.queries or [ ])
-                  )
-                )
-              ) (coerceList (req.body.query.bool.must or [ ]))
-            )
-          );
-
-          # Parse pagination params.
-          size = max 0 (min 50 (coerceInt (req.body.size or 50)));
-          from = max 0 (coerceInt (req.body.from or 0));
-
-          # Select the package set.
-          packageSet =
-            version:
+          parsedRequest =
             let
-              packageSetMatch = match "^.+-(nixos-(.+)|group-manual)$" version;
-            in
-            if version == null || packageSetMatch == null then
-              "nixpkgs"
-            else if head packageSetMatch == "group-manual" then
-              "flake"
-            else if match "^[0-9]{2}\\.[0-9]{2}$" (elemAt packageSetMatch 1) != null then
-              "stable"
-            else
-              "nixpkgs";
+              # Pull all the filters out of the search query.
+              filters = filter (x: (emptyToNull x) != null) (
+                map (x: coerceString (x.term.type._name or null)) (
+                  coerceList (tryOr [ ] (req.body.query.bool.filter or [ ]))
+                )
+              );
 
-          # Pick the package set.
-          thePackageSet = packageSet (req.params.version or null);
-          isFlakeSearch = thePackageSet == "flake";
+              # True if we are searching packages.
+              isPackageSearch = findFirst (x: x == "filter_packages") null filters != null;
+
+              # Likewise for options.
+              isOptionSearch = findFirst (x: x == "filter_options") null filters != null;
+
+              # The search parameter for the current search mode.
+              searchParam =
+                if isPackageSearch then
+                  "package_attr_name"
+                else if isOptionSearch then
+                  "option_name"
+                else
+                  # default to package search
+                  "package_attr_name";
+
+              # Pull all of the must parameters out of the search query.
+              normalizeQuery = query: toLower (removePrefix "*" (removeSuffix "*" query));
+
+              # Select the package set.
+              choosePackageSet =
+                version:
+                let
+                  packageSetMatch = match "^.+-(nixos-(.+)|group-manual)$" version;
+                  matchedVersion = elemAt packageSetMatch 1;
+                in
+                if version == null || packageSetMatch == null then
+                  "unstable"
+                else if head packageSetMatch == "group-manual" then
+                  "flake"
+                else if match "^[0-9]{2}\\.[0-9]{2}$" matchedVersion != null then
+                  if matchedVersion == majorMinor nixpkgsOptions.stable.lib.version then
+                    "stable"
+                  else if matchedVersion == majorMinor nixpkgsOptions.legacy.lib.version then
+                    "legacy"
+                  else if matchedVersion == majorMinor nixpkgsOptions.unstable.lib.version then
+                    "unstable"
+                  else
+                    "unstable"
+                else
+                  "unstable";
+            in
+            rec {
+              musts = map normalizeQuery (
+                flatten (
+                  map (
+                    must:
+                    filter (x: (emptyToNull x) != null) (
+                      map (query: coerceString (query.wildcard.${searchParam}.value or null)) (
+                        coerceList (must.dis_max.queries or [ ])
+                      )
+                    )
+                  ) (coerceList (tryOr [ ] (req.body.query.bool.must or [ ])))
+                )
+              );
+
+              # Parse pagination params.
+              size = max 0 (min 50 (coerceInt (tryOr 50 (req.body.size or 50))));
+              from = max 0 (coerceInt (tryOr 0 (req.body.from or 0)));
+
+              # Pick the package set.
+              packageSet = choosePackageSet (tryOrNull (req.params.version or null));
+
+              inherit isPackageSearch isOptionSearch;
+              isFlakeSearch = packageSet == "flake";
+            };
 
           # Figure out the nixpkgs to use from the package set.
-          theNixpkgs =
-            {
-              nixpkgs = inputs'.nixpkgs;
-              stable = inputs'.nixpkgs-stable;
+          nixpkgsOptions = {
+            unstable = inputs'.nixpkgs;
+            stable = inputs'.nixpkgs-stable;
+            legacy = inputs'.nixpkgs-legacy;
 
-              # Use unstable when evaluating flakes.
-              flake = inputs'.nixpkgs;
-            }
-            .${thePackageSet};
-
-          # Eval the things we need to search.
-          inherit
-            (import ./eval-packages.nix {
-              inherit (theNixpkgs) lib;
-              pkgs = theNixpkgs.legacyPackages.${req.system};
-            })
-            packagesUnder
-            flakeOptionsUnder
-            nixosOptionsUnder
-            ;
-
-          # Possibly overrides a flake URL with the specified name.
-          # Used to take input flake URLs and replace them with the ones Flack knows about.
-          overrideFlakeUrl =
-            name: url:
-            let
-              overrideInput = req.overrideInput name;
-            in
-            if overrideInput == null then
-              if isString url then
-                url
-              else if isPath url then
-                # Can't refer to a store path in here, need something.
-                "github:~${name}/${concatStrings (tail (splitString "-" (baseNameOf url)))}"
-              else
-                toString url
-            else
-              overrideInput;
-
-          # Returns true if the given attribute name is probably nixpkgs (e.g. 'nixpkgs',
-          # 'nixpkgs[_-]XX[_.-]YY', 'nixpkgs-stable', 'nixpkgs-unstable', or the nixos versions).
-          # Also special-cases nixos-search and flack since they are two of our flake inputs.
-          maybeNixpkgs =
-            name:
-            name == "flack"
-            || match "^nix(pkgs|os)([_-]([0-9_\\.-]+)$|[_-](un)?stable$|[_-]search$|$)" name != null;
-
-          # Creates extra data depending on whether we are searching a flake or not.
-          mkExtra =
-            name: flake:
-            {
-              inherit name;
-            }
-            // optionalAttrs isFlakeSearch {
-              inherit flake;
-            };
-
-          # All packages we are searching for. Looks at their packages or legacyPackages.
-          packageResultsFor =
-            flakes:
-            concatMap (
-              { name, value }:
-              if value ? packages.${req.system} then
-                packagesUnder [ ] (_: _: true) (mkExtra name value) value.packages.${req.system}
-              else if value ? legacyPackages.${req.system} then
-                packagesUnder [ ] (_: _: true) (mkExtra name value) value.legacyPackages.${req.system}
-              else
-                [ ]
-            ) (attrsToList flakes);
-
-          # All options we are searching for. Looks at their nixosModule or nixosModules.
-          optionResultsFor =
-            flakes:
-            concatMap (
-              { name, value }:
-              if maybeNixpkgs name then
-                nixosOptionsUnder {
-                  nixpkgs = value;
-                  extra = mkExtra name value;
-                }
-              else
-                flakeOptionsUnder {
-                  nixpkgs = theNixpkgs;
-                  inherit name;
-                  flake = value;
-                  resolved = value;
-                  extra = mkExtra name value;
-                  urlOverride = overrideFlakeUrl;
-                }
-            ) (attrsToList flakes);
-
-          # Results from the above.
-          allResults =
-            let
-              selectedFlakes =
-                if isFlakeSearch then filterAttrs (n: v: !(maybeNixpkgs n)) inputs' else { nixpkgs = theNixpkgs; };
-            in
-            if isPackageSearch then
-              packageResultsFor selectedFlakes
-            else if isOptionSearch then
-              optionResultsFor selectedFlakes
-            else
-              throw "neither package nor option search was selected";
-
-          # Compute matches using a pretty rudimentary algorithm.
-          # TODO: extend to other package sets, and use a trigram index for sub-O(n).
-          matches = filter (x: any (q: hasInfix q (toLower x.name)) musts) allResults;
-
-          # These are useful for various search helpers
-          emptyToNull = x: if x == "" then null else x;
-          nullToEmpty = x: if x == null then "" else x;
-
-          # Converts a nixpkgs maintainer to JSON.
-          toMaintainer = maintainer: {
-            name = maintainer.name or "";
-            github = emptyToNull (maintainer.github or "");
-            email = emptyToNull (maintainer.email or "");
+            # Use unstable when evaluating flakes.
+            flake = inputs'.nixpkgs;
           };
 
-          # Creates the derivation position by stripping the store prefix.
-          toPosition =
-            position:
-            let
-              matchResult = match "^/nix/store/[^/]+/(.+)$" position;
-            in
-            if position == null || matchResult == null then null else head matchResult;
-
-          # Creates a license list.
-          toLicenses =
-            licenses:
-            if isList licenses then
-              licenses
-            else if isString licenses then
-              singleton rec {
-                shortName = licenses;
-                fullName = shortName;
-              }
-            else
-              singleton licenses;
-
-          # Creates a flake source.
-          mkFlakeSource =
+          getSearchResults =
             {
-              name,
-              flake,
+              packageSet,
+              musts ? [ "" ],
+              isPackageSearch ? false,
+              isOptionSearch ? false,
+              isFlakeSearch ? false,
+              size ? 50,
+              from ? 0,
               ...
             }:
-            rec {
-              flake_name = name;
-              flake_description = emptyToNull (flake.description or "");
-              revision = flake.rev or flake.dirtyRev or null;
-              flake_source =
-                if flake ? url && builtins ? parseFlakeRef then
-                  let
-                    ref = builtins.parseFlakeRef (overrideFlakeUrl name flake.url);
-                  in
-                  {
-                    inherit (ref) type;
-                    owner = ref.owner or null;
-                    repo = ref.repo or null;
-                    git_ref = ref.ref or null;
-                    description = flake.description or null;
+            let
+              theNixpkgs = nixpkgsOptions.${packageSet};
+
+              # Eval the things we need to search.
+              inherit
+                (import ./eval-packages.nix {
+                  inherit (theNixpkgs) lib;
+                  inherit flack;
+                  pkgs = theNixpkgs.legacyPackages.${req.system};
+                })
+                packagesUnder
+                flakeOptionsUnder
+                nixosOptionsUnder
+                isFlackReservedPath
+                ;
+
+              # Possibly overrides a flake URL with the specified name.
+              # Used to take input flake URLs and replace them with the ones Flack knows about.
+              overrideFlakeUrl =
+                name: url:
+                let
+                  overrideInput = req.overrideInput name;
+                in
+                if overrideInput == null then
+                  if isString url then
+                    url
+                  else if isPath url then
+                    # Can't refer to a store path in here, need something.
+                    "github:~${name}/${concatStrings (tail (splitString "-" (baseNameOf url)))}"
+                  else
+                    toString url
+                else
+                  overrideInput;
+
+              # Returns true if the given attribute name is probably nixpkgs (e.g. 'nixpkgs',
+              # 'nixpkgs[_-]XX[_.-]YY', 'nixpkgs-stable', 'nixpkgs-unstable', or the nixos versions).
+              # Also special-cases nixos-search and flack since they are two of our flake inputs.
+              maybeNixpkgs =
+                name:
+                name == "flack"
+                || match "^nix(pkgs|os)([_-]([0-9_\\.-]+)$|[_-](un)?stable$|[_-]search$|$)" name != null;
+
+              # Creates extra data depending on whether we are searching a flake or not.
+              mkExtra =
+                name: flake:
+                {
+                  inherit name;
+                }
+                // optionalAttrs isFlakeSearch {
+                  inherit flake;
+                };
+
+              # Skip packages that have a reserved path (e.g. flack closure info) or are marked don't index.
+              packagePredicate = path: val: !(isFlackReservedPath path) && !(val.flackDontIndex or false);
+
+              # All packages we are searching for. Looks at their packages or legacyPackages.
+              packageResultsFor =
+                flakes:
+                let
+                  TAG = "packageResultsFor";
+                in
+                concatMap (
+                  { name, value }:
+                  if value ? packages.${req.system} then
+                    assert Log.d' TAG "Checking packages ${name} -> ${value}";
+                    tryOr [ ] (packagesUnder [ ] packagePredicate (mkExtra name value) value.packages.${req.system})
+                  else if value ? legacyPackages.${req.system} then
+                    assert Log.d' TAG "Checking legacyPackages ${name} -> ${value}";
+                    tryOr [ ] (
+                      packagesUnder [ ] packagePredicate (mkExtra name value) value.legacyPackages.${req.system}
+                    )
+                  else
+                    [ ]
+                ) (attrsToList flakes);
+
+              # All options we are searching for. Looks at their nixosModule or nixosModules.
+              optionResultsFor =
+                flakes:
+                let
+                  TAG = "optionResultsFor";
+                in
+                concatMap (
+                  { name, value }:
+                  if maybeNixpkgs name then
+                    assert Log.d' TAG "Checking NixOS options under ${name} -> ${value}";
+                    nixosOptionsUnder {
+                      nixpkgs = value;
+                      extra = mkExtra name value;
+                    }
+                  else
+                    assert Log.d' TAG "Checking flake options under ${name} -> ${value}";
+                    flakeOptionsUnder {
+                      nixpkgs = theNixpkgs;
+                      inherit name;
+                      flake = value;
+                      resolved = value;
+                      extra = mkExtra name value;
+                      urlOverride = overrideFlakeUrl;
+                    }
+                ) (attrsToList flakes);
+
+              # Results from the above.
+              allResults =
+                let
+                  selectedFlakes =
+                    if isFlakeSearch then
+                      filterAttrs (n: v: !(maybeNixpkgs n)) inputs'
+                    else
+                      { "nixpkgs-${packageSet}" = theNixpkgs; };
+                in
+                if isPackageSearch then
+                  packageResultsFor selectedFlakes
+                else if isOptionSearch then
+                  optionResultsFor selectedFlakes
+                else
+                  throw "neither package nor option search was selected";
+
+              # Compute matches using a pretty rudimentary algorithm.
+              # TODO: extend to other package sets, and use a trigram index for sub-O(n).
+              matches = parallel allResults (filter (x: any (q: hasInfix q (toLower x.name)) musts) allResults);
+
+              # Converts a nixpkgs maintainer to JSON.
+              toMaintainer = maintainer: {
+                name = maintainer.name or "";
+                github = emptyToNull (maintainer.github or "");
+                email = emptyToNull (maintainer.email or "");
+              };
+
+              # Creates the derivation position by stripping the store prefix.
+              toPosition =
+                position:
+                let
+                  matchResult = match "^/nix/store/[^/]+/(.+)$" position;
+                in
+                if position == null || matchResult == null then null else head matchResult;
+
+              # Creates a license list.
+              toLicenses =
+                licenses:
+                if isList licenses then
+                  licenses
+                else if isString licenses then
+                  singleton rec {
+                    shortName = licenses;
+                    fullName = shortName;
                   }
                 else
-                  null;
-              flake_resolved = flake_source;
-            };
+                  singleton licenses;
 
-          # Creates a package source.
-          mkPackageSource =
-            {
-              name,
-              packageName,
-              version,
-              package,
-              flake ? { },
-            }:
-            {
-              type = "package";
-              package_attr_name = name;
-              package_attr_set = head (splitString "." name);
-              package_pname = packageName;
-              package_pversion = version;
-              package_platforms = filter isString (package.meta.platforms or [ ]);
-              package_outputs = package.outputs or [ ];
-              package_default_output = package.outputName or "out";
-              package_programs = [ ]; # XXX needs sqlite db from hydra.
-              package_mainProgram = emptyToNull (package.meta.mainProgram or null);
-              package_license = map (x: {
-                fullName = x.fullName or x.shortName or "";
-                url = x.url or null;
-              }) (toLicenses (package.meta.license or [ ]));
-              package_license_set = map (x: x.fullName) (toLicenses (package.meta.license or [ ]));
-              package_maintainers = map toMaintainer (package.meta.maintainers or [ ]);
-              package_maintainers_set = map (x: x.name) (package.meta.maintainers or [ ]);
-              package_teams = map (x: {
-                members = map toMaintainer x.members;
-                shortName = emptyToNull (x.shortName or "");
-                scope = emptyToNull (x.scope or null);
-                githubTeams = x.githubTeams or [ ];
-              }) (package.meta.teams or [ ]);
-              package_teams_set = map (x: x.shortName) (package.meta.teams or [ ]);
-              package_description = emptyToNull (package.meta.description or "");
-              package_longDescription = emptyToNull (package.meta.longDescription or "");
-              package_hydra = null; # XXX where does this come from?
-              package_system = nullToEmpty (package.system or null);
-              package_homepage = package.meta.homepage or "";
-              package_position = toPosition (package.meta.position or null);
-            }
-            // optionalAttrs (flake ? flake) (mkFlakeSource flake);
+              # Creates a flake source.
+              mkFlakeSource =
+                {
+                  name,
+                  flake,
+                  ...
+                }:
+                rec {
+                  flake_name = name;
+                  flake_description = emptyToNull (flake.description or "");
+                  revision = flake.rev or flake.dirtyRev or null;
+                  flake_source =
+                    if flake ? url && builtins ? parseFlakeRef then
+                      let
+                        ref = builtins.parseFlakeRef (overrideFlakeUrl name flake.url);
+                      in
+                      {
+                        inherit (ref) type;
+                        owner = ref.owner or null;
+                        repo = ref.repo or null;
+                        git_ref = ref.ref or null;
+                        description = flake.description or null;
+                      }
+                    else
+                      null;
+                  flake_resolved = flake_source;
+                };
 
-          # Creates an option source.
-          mkOptionSource =
-            {
-              name,
-              option,
-              flake ? option.extra or { },
-            }:
-            {
-              type = "option";
-              option_name = name;
-              option_source =
+              # Creates a package source.
+              mkPackageSource =
+                {
+                  name,
+                  packageName,
+                  version,
+                  package,
+                  flake ? { },
+                }:
+                {
+                  type = "package";
+                  package_attr_name = name;
+                  package_attr_set = head (splitString "." name);
+                  package_pname = packageName;
+                  package_pversion = version;
+                  package_platforms = filter isString (package.meta.platforms or [ ]);
+                  package_outputs = package.outputs or [ ];
+                  package_default_output = package.outputName or "out";
+                  package_programs = [ ]; # XXX needs sqlite db from hydra.
+                  package_mainProgram = emptyToNull (package.meta.mainProgram or null);
+                  package_license = map (x: {
+                    fullName = x.fullName or x.shortName or "";
+                    url = x.url or null;
+                  }) (toLicenses (package.meta.license or [ ]));
+                  package_license_set = map (x: x.fullName) (toLicenses (package.meta.license or [ ]));
+                  package_maintainers = map toMaintainer (package.meta.maintainers or [ ]);
+                  package_maintainers_set = map (x: x.name) (package.meta.maintainers or [ ]);
+                  package_teams = map (x: {
+                    members = map toMaintainer x.members;
+                    shortName = emptyToNull (x.shortName or "");
+                    scope = emptyToNull (x.scope or null);
+                    githubTeams = x.githubTeams or [ ];
+                  }) (package.meta.teams or [ ]);
+                  package_teams_set = map (x: x.shortName) (package.meta.teams or [ ]);
+                  package_description = emptyToNull (package.meta.description or "");
+                  package_longDescription = emptyToNull (package.meta.longDescription or "");
+                  package_hydra = null; # XXX where does this come from?
+                  package_system = nullToEmpty (package.system or null);
+                  package_homepage = package.meta.homepage or "";
+                  package_position = toPosition (package.meta.position or null);
+                }
+                // optionalAttrs (flake ? flake) (mkFlakeSource flake);
+
+              # Creates an option source.
+              mkOptionSource =
+                {
+                  name,
+                  option,
+                  flake ? option.extra or { },
+                }:
+                {
+                  type = "option";
+                  option_name = name;
+                  option_source =
+                    let
+                      declarations = option.declarations or [ ];
+                    in
+                    if declarations == null || declarations == [ ] then "unknown" else head declarations;
+                  # XXX: This needs Markdown rendering but we can get away with the ugly thing for now.
+                  option_description =
+                    let
+                      description = emptyToNull (option.description or "");
+                    in
+                    if description == null then null else "<rendered-html>${escapeXML description}</rendered-html>";
+                  option_type = option.type or "";
+                  option_default = emptyToNull (toString (option.default.text or ""));
+                  option_example = emptyToNull (toString (option.example.text or ""));
+                  option_flake = option.modulePath or null;
+                }
+                // optionalAttrs (flake ? flake) (mkFlakeSource flake);
+
+              # Creates an arbitrary Elasticsearch document.
+              mkDoc =
+                {
+                  idx,
+                  source,
+                  sort,
+                }:
+                rec {
+                  _index = "flack";
+                  _type = "_doc";
+                  _id = toString idx;
+                  _score = 1.0;
+                  _source = source;
+                  _sort = singleton _score ++ sort;
+                  matched_queries =
+                    optional isPackageSearch "filter_packages" ++ optional isOptionSearch "filter_options";
+                };
+
+              # Creates a "hit" for a package.
+              mkPackageHit =
+                idx:
+                {
+                  name,
+                  value,
+                  extra ? { },
+                  ...
+                }:
                 let
-                  declarations = option.declarations or [ ];
+                  packageName = value.pname or value.name or name;
+                  version =
+                    let
+                      version' = value.version or "";
+                    in
+                    if version' == null then "" else version';
                 in
-                if declarations == null || declarations == [ ] then "unknown" else head declarations;
-              # XXX: This needs Markdown rendering but we can get away with the ugly thing for now.
-              option_description =
-                let
-                  description = emptyToNull (option.description or "");
-                in
-                if description == null then null else "<rendered-html>${escapeXML description}</rendered-html>";
-              option_type = option.type or "";
-              option_default = emptyToNull (toString (option.default.text or ""));
-              option_example = emptyToNull (toString (option.example.text or ""));
-              option_flake = option.modulePath or null;
-            }
-            // optionalAttrs (flake ? flake) (mkFlakeSource flake);
+                mkDoc {
+                  inherit idx;
+                  source = mkPackageSource (
+                    {
+                      inherit name packageName version;
+                      package = value;
+                    }
+                    // optionalAttrs (extra ? flake) {
+                      flake = extra;
+                    }
+                  );
+                  sort = [
+                    packageName
+                    version
+                  ];
+                };
 
-          # Creates an arbitrary Elasticsearch document.
-          mkDoc =
-            {
-              idx,
-              source,
-              sort,
-            }:
-            rec {
-              _index = "flack";
-              _type = "_doc";
-              _id = "${req.id}.${toString idx}";
-              _score = 1.0;
-              _source = source;
-              _sort = singleton _score ++ sort;
-              matched_queries = filters;
-            };
+              # Creates a hit for an option.
+              mkOptionHit =
+                idx:
+                {
+                  name,
+                  value,
+                  extra ? { },
+                  ...
+                }:
+                mkDoc {
+                  inherit idx;
+                  source = mkOptionSource (
+                    {
+                      inherit name;
+                      option = value;
+                    }
+                    // optionalAttrs (extra ? flake) {
+                      flake = extra;
+                    }
+                  );
+                  sort = [ name ];
+                };
 
-          # Creates a "hit" for a package.
-          mkPackageHit =
-            idx:
-            {
-              name,
-              value,
-              extra ? { },
-              ...
-            }:
-            let
-              packageName = value.pname or value.name or name;
-              version =
-                let
-                  version' = value.version or "";
-                in
-                if version' == null then "" else version';
+              # Creates a hit for the current search term.
+              mkHit = if isPackageSearch then mkPackageHit else mkOptionHit;
+
+              # Creates a buckets JSON.
+              mkBuckets = total: buckets: {
+                doc_count_error_upper_bound = 0;
+                sum_other_doc_count = total;
+                inherit buckets;
+              };
+
+              # Creates aggregations.
+              aggregations =
+                all:
+                optionalAttrs isPackageSearch {
+                  package_attr_set = mkBuckets 0 [ ];
+                  package_maintainers_set = mkBuckets 0 [ ];
+                  package_teams_set = mkBuckets 0 [ ];
+                  package_platforms = mkBuckets 0 [ ];
+                  package_license_set = mkBuckets 0 [ ];
+                };
             in
-            mkDoc {
-              inherit idx;
-              source = mkPackageSource (
-                {
-                  inherit name packageName version;
-                  package = value;
-                }
-                // optionalAttrs (extra ? flake) {
-                  flake = extra;
-                }
-              );
-              sort = [
-                packageName
-                version
-              ];
-            };
-
-          # Creates a hit for an option.
-          mkOptionHit =
-            idx:
             {
-              name,
-              value,
-              extra ? { },
-              ...
-            }:
-            mkDoc {
-              inherit idx;
-              source = mkOptionSource (
-                {
-                  inherit name;
-                  option = value;
+              took = 1;
+              timed_out = false;
+
+              # Not sure what to put here... one shard, zero failed sounds reasonable.
+              _shards = {
+                total = 1;
+                successful = 1;
+                skipped = 0;
+                failed = 0;
+              };
+
+              hits = {
+                total = {
+                  value = length matches;
+                  relation = "eq";
+                };
+                max_score = null;
+
+                # Paginate the matched packages.
+                hits =
+                  let
+                    matches' = sublist from size matches;
+                  in
+                  parallel matches' (imap0 mkHit matches');
+              };
+
+              # TODO: implement aggregations.
+              aggregations = {
+                all = {
+                  doc_count = length allResults;
                 }
-                // optionalAttrs (extra ? flake) {
-                  flake = extra;
-                }
-              );
-              sort = [ name ];
-            };
-
-          # Creates a hit for the current search term.
-          mkHit = if isPackageSearch then mkPackageHit else mkOptionHit;
-
-          # Creates a buckets JSON.
-          mkBuckets = total: buckets: {
-            doc_count_error_upper_bound = 0;
-            sum_other_doc_count = total;
-            inherit buckets;
-          };
-
-          # Creates aggregations.
-          aggregations =
-            all:
-            optionalAttrs isPackageSearch {
-              package_attr_set = mkBuckets 0 [ ];
-              package_maintainers_set = mkBuckets 0 [ ];
-              package_teams_set = mkBuckets 0 [ ];
-              package_platforms = mkBuckets 0 [ ];
-              package_license_set = mkBuckets 0 [ ];
+                // aggregations true;
+              }
+              // aggregations false;
             };
         in
-        req.res 200 {
-          took = 1;
-          timed_out = false;
-
-          # Not sure what to put here... one shard, zero failed sounds reasonable.
-          _shards = {
-            total = 1;
-            successful = 1;
-            skipped = 0;
-            failed = 0;
-          };
-
-          hits = {
-            total = {
-              value = length matches;
-              relation = "eq";
+        req.res 200 { }
+          (getSearchResults {
+            inherit (parsedRequest)
+              packageSet
+              musts
+              isPackageSearch
+              isOptionSearch
+              isFlakeSearch
+              size
+              from
+              ;
+          })
+          {
+            legacyPackageSearch = getSearchResults {
+              packageSet = "legacy";
+              isPackageSearch = true;
             };
-            max_score = null;
-
-            # Paginate the matched packages.
-            hits = sublist from size (imap0 mkHit matches);
+            legacyOptionSearch = getSearchResults {
+              packageSet = "legacy";
+              isOptionSearch = true;
+            };
+            stablePackageSearch = getSearchResults {
+              packageSet = "stable";
+              isPackageSearch = true;
+            };
+            stableOptionSearch = getSearchResults {
+              packageSet = "stable";
+              isOptionSearch = true;
+            };
+            unstablePackageSearch = getSearchResults {
+              packageSet = "unstable";
+              isPackageSearch = true;
+            };
+            unstableOptionSearch = getSearchResults {
+              packageSet = "unstable";
+              isOptionSearch = true;
+            };
+            flakePackageSearch = getSearchResults {
+              packageSet = "flake";
+              isFlakeSearch = true;
+              isPackageSearch = true;
+            };
+            flakeOptionSearch = getSearchResults {
+              packageSet = "flake";
+              isFlakeSearch = true;
+              isOptionSearch = true;
+            };
+            nixpkgsOptions = attrValues nixpkgsOptions;
           };
-
-          # TODO: implement aggregations.
-          aggregations = {
-            all = {
-              doc_count = length allResults;
-            }
-            // aggregations true;
-          }
-          // aggregations false;
-        };
     };
   };
 }

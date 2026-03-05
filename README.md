@@ -8,18 +8,8 @@ and provides a web router API written in Nix that works like [Express](https://e
 It works with both flakes and non-flakes, using [idc](https://github.com/jakehamilton/idc) to load projects that it can't natively
 load with Nix.
 
-## Start search.nixos.org on any flake!
-
-The following example will document options and packages in [nixPKCS](https://github.com/numinit/nixpkcs).
-Visit http://localhost:2020, click the "Flakes" button, and type "pkcs11" to see module options and packages.
-
-    nix run github:numinit/flack -- --flake github:numinit/flack?dir=search \
-        --override-input flake github:numinit/nixpkcs
-
-You can override the 'flake' input of the search app to any flake you want.
-
-The first request on each channel may take up to 30 seconds to load as nixpkgs is evaluated
-(and nixos-search is compiled in the background). Subsequent requests will be fast.
+Flack can also compute the closure of your webapp automatically with Nix and eagerly
+load it at runtime, making deployment of Flack apps as easy as other Nix applications.
 
 ## Experimental
 
@@ -65,6 +55,20 @@ Here's an example with flakes. Use `--flake` as your flake ref and (optionally)
 For non-flakes, so long as `idc` can load it and you expose an attribute with
 a Flack app, it will probably work. Use `--import` and/or `--dir` to point Nix
 at the directory or file to load. This also works fine with flakes.
+
+## Start search.nixos.org on any flake!
+
+The following example will document options and packages in [nixPKCS](https://github.com/numinit/nixpkcs).
+Visit http://localhost:2020, click the "Flakes" button, and type "pkcs11" to see module options and packages.
+
+    nix run github:numinit/flack -- --flake github:numinit/flack?dir=search \
+        --override-input flake github:numinit/nixpkcs
+
+You can override the 'flake' input of the search app to any flake you want.
+
+The first request on each channel may take up to 30 seconds to load as nixpkgs is evaluated
+(and nixos-search is compiled in the background). Subsequent requests will be fast.
+
 
 ## Examples
 
