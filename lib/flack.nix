@@ -398,6 +398,9 @@ let
                     for (( idx=0; idx < "''${#closurePathsArray[@]}"; idx++ )); do
                       name="''${closureNamesArray[idx]}"
                       path="''${closurePathsArray[idx]}"
+
+                      # If there are any placeholders, we may still be able to get back to a real path.
+                      path="''${path///%/}"
                       dedup=1
                       base="$name"
                       while [ -e "$name" ]; do
